@@ -364,121 +364,43 @@ read_formula_version() {
 }
 
 # 写入或插入 formula 的 version 属性，不改 url / sha256。
-ensure_formula_version() {
+# 把 url 写成具体地址，并把 version 放到 url 后面，符合 Homebrew 的字段顺序。
+rewrite_formula_fields() {
     local file="$1"
     local version="$2"
-    local count tmp awk_status insert
+    local url="$3"
+    local hash="$4"
+    local tmp awk_status
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
-    count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
-    if [[ "$count" -gt 1 ]]; then
-        die "formula 里只能有一个 version 属性: $file"
-    fi
-    if [[ "$count" -eq 0 ]]; then
-        insert=1
-    else
-        insert=0
-    fi
     tmp="$(mktemp)"
-    awk -v ver="$version" -v insert="$insert" '
-        BEGIN { done = 0; skip_old = 0 }
+    awk -v url="$url" -v hash="$hash" -v ver="$version" '
+        BEGIN { url_done = 0; sha_done = 0; ver_done = 0 }
         {
-            if (done == 0 && $0 ~ /^[[:space:]]*url[[:space:]]+"/ && $0 ~ /#\{version\}/) {
-                match($0, /^[[:space:]]*/)
-                indent = substr($0, 1, RLENGTH)
-                print indent "version \"" ver "\""
-                print
-                done = 1
-                skip_old = 1
+            if ($0 ~ /^[[:space:]]*# version 必须写在 url 前面/) {
                 next
             }
-            if (skip_old == 1 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
+            if ($0 ~ /^[[:space:]]*# rubocop:(disable|enable) FormulaAudit\/ComponentsOrder[[:space:]]*$/) {
                 next
             }
-            if (done == 0 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
-                match($0, /^[[:space:]]*/)
-                indent = substr($0, 1, RLENGTH)
-                print indent "version \"" ver "\""
-                done = 1
+            if ($0 ~ /^[[:space:]]*version[[:space:]]+"/) {
                 next
             }
-            if (insert == 1 && done == 0 && $0 ~ /^[[:space:]]*sha256[[:space:]]+"/) {
-                match($0, /^[[:space:]]*/)
-                indent = substr($0, 1, RLENGTH)
-                print indent "version \"" ver "\""
-                done = 1
-                print
-                next
-            }
-            print
-        }
-        END { if (done == 0) exit 2 }
-    ' "$file" > "$tmp" && awk_status=0 || awk_status=$?
-    if [[ "$awk_status" -ne 0 ]]; then
-        rm -f "$tmp"
-        die "无法写入 formula 的 version 属性: $file"
-    fi
-    replace_file_preserving_mode "$file" "$tmp"
-}
-
-# 更新顶层 url、sha256，并保证有且只有一个 version 属性。
-update_formula_file() {
-    local file="$1"
-    local url="$2"
-    local hash="$3"
-    local version="$4"
-    local tmp awk_status url_count sha_count ver_count insert
-    [[ -f "$file" ]] || die "formula 文件不存在: $file"
-    url_count="$(count_formula_lines "$file" '^[[:space:]]*url[[:space:]]+"')"
-    sha_count="$(count_formula_lines "$file" '^[[:space:]]*sha256[[:space:]]+"')"
-    ver_count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
-    if [[ "$url_count" -ne 1 || "$sha_count" -ne 1 ]]; then
-        die "formula 需要且只能有一对顶层 url 与 sha256（当前 url=${url_count} sha256=${sha_count}）: $file"
-    fi
-    if [[ "$ver_count" -gt 1 ]]; then
-        die "formula 里只能有一个 version 属性: $file"
-    fi
-    if [[ "$ver_count" -eq 0 ]]; then
-        insert=1
-    else
-        insert=0
-    fi
-    tmp="$(mktemp)"
-    awk -v url="$url" -v hash="$hash" -v ver="$version" -v insert="$insert" '
-        BEGIN { url_done = 0; sha_done = 0; ver_done = 0; skip_old_version = 0 }
-        {
             if (url_done == 0 && $0 ~ /^[[:space:]]*url[[:space:]]+"/) {
                 match($0, /^[[:space:]]*/)
                 indent = substr($0, 1, RLENGTH)
-                if ($0 ~ /#\{version\}/) {
-                    if (ver_done == 0) {
-                        print indent "version \"" ver "\""
-                        ver_done = 1
-                        skip_old_version = 1
-                    }
-                    print
-                } else {
+                if (url != "") {
                     print indent "url \"" url "\""
+                } else {
+                    line = $0
+                    gsub(/#\{version\}/, ver, line)
+                    print line
                 }
-                url_done = 1
-                next
-            }
-            if (skip_old_version == 1 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
-                next
-            }
-            if (ver_done == 0 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
-                match($0, /^[[:space:]]*/)
-                indent = substr($0, 1, RLENGTH)
                 print indent "version \"" ver "\""
+                url_done = 1
                 ver_done = 1
                 next
             }
-            if (sha_done == 0 && $0 ~ /^[[:space:]]*sha256[[:space:]]+"/) {
-                if (insert == 1 && ver_done == 0) {
-                    match($0, /^[[:space:]]*/)
-                    indent = substr($0, 1, RLENGTH)
-                    print indent "version \"" ver "\""
-                    ver_done = 1
-                }
+            if (hash != "" && sha_done == 0 && $0 ~ /^[[:space:]]*sha256[[:space:]]+"/) {
                 match($0, /^[[:space:]]*/)
                 indent = substr($0, 1, RLENGTH)
                 print indent "sha256 \"" hash "\""
@@ -489,7 +411,7 @@ update_formula_file() {
         }
         END {
             if (url_done == 0) exit 2
-            if (sha_done == 0) exit 3
+            if (hash != "" && sha_done == 0) exit 3
             if (ver_done == 0) exit 4
         }
     ' "$file" > "$tmp" && awk_status=0 || awk_status=$?
@@ -498,60 +420,39 @@ update_formula_file() {
         die "更新 formula 失败: $file"
     fi
     replace_file_preserving_mode "$file" "$tmp"
-    protect_interpolated_version "$file"
 }
 
-# url 使用 #{version} 时，version 必须写在 url 前面。
-# brew style 的 ComponentsOrder 会把 url 移到 version 之前，地址会变成 v.tar.gz。
-# Homebrew 不允许在公式里写 rubocop:disable，所以这里在 style 之后把顺序改回来。
-protect_interpolated_version() {
+ensure_formula_version() {
     local file="$1"
-    local tmp awk_status
+    local version="$2"
+    local url="$3"
+    local count
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
-    if ! grep -Eq '^[[:space:]]*url[[:space:]]+".*#\{version\}' "$file"; then
-        return 0
+    count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
+    if [[ "$count" -gt 1 ]]; then
+        die "formula 里只能有一个 version 属性: $file"
     fi
-    tmp="$(mktemp)"
-    awk '
-        function is_rubocop(line) {
-            return line ~ /^[[:space:]]*# rubocop:(disable|enable) FormulaAudit\/ComponentsOrder[[:space:]]*$/
-        }
-        BEGIN { n = 0; ver_i = 0; url_i = 0 }
-        {
-            if (is_rubocop($0)) {
-                next
-            }
-            n++
-            lines[n] = $0
-            if (ver_i == 0 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
-                ver_i = n
-            }
-            if (url_i == 0 && $0 ~ /^[[:space:]]*url[[:space:]]+"/ && $0 ~ /#\{version\}/) {
-                url_i = n
-            }
-        }
-        END {
-            if (ver_i == 0 || url_i == 0) {
-                exit 2
-            }
-            for (i = 1; i <= n; i++) {
-                if (i == ver_i) {
-                    continue
-                }
-                if (i == url_i) {
-                    print lines[ver_i]
-                    print lines[i]
-                    continue
-                }
-                print lines[i]
-            }
-        }
-    ' "$file" > "$tmp" && awk_status=0 || awk_status=$?
-    if [[ "$awk_status" -ne 0 ]]; then
-        rm -f "$tmp"
-        die "无法保持 formula 中 version 与 #{version} 的顺序: $file"
+    rewrite_formula_fields "$file" "$version" "$url" ""
+}
+
+# 更新顶层 url、sha256，并保证 version 紧跟在 url 后面。
+update_formula_file() {
+    local file="$1"
+    local url="$2"
+    local hash="$3"
+    local version="$4"
+    local url_count sha_count ver_count
+    [[ -f "$file" ]] || die "formula 文件不存在: $file"
+    url_count="$(count_formula_lines "$file" '^[[:space:]]*url[[:space:]]+"')"
+    sha_count="$(count_formula_lines "$file" '^[[:space:]]*sha256[[:space:]]+"')"
+    ver_count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
+    if [[ "$url_count" -ne 1 || "$sha_count" -ne 1 ]]; then
+        die "formula 需要且只能有一对顶层 url 与 sha256（当前 url=${url_count} sha256=${sha_count}）: $file"
     fi
-    replace_file_preserving_mode "$file" "$tmp"
+    if [[ "$ver_count" -gt 1 ]]; then
+        die "formula 里只能有一个 version 属性: $file"
+    fi
+    rewrite_formula_fields "$file" "$version" "$url" "$hash"
 }
 
 archive_is_gzip() {
@@ -1325,9 +1226,8 @@ write_formula_template() {
 class ${class_name} < Formula
   desc "Install ${formula_name}"
   homepage "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}"
-  # version 必须写在 url 前面，#{version} 才会被替换。
+  url "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/archive/refs/tags/${TAG_PREFIX}${version}.tar.gz"
   version "${version}"
-  url "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/archive/refs/tags/${TAG_PREFIX}#{version}.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
@@ -1491,7 +1391,7 @@ main() {
             log "更新 ${FORMULA_FILE} 的 version → ${NEW_VERSION}"
         fi
         if [[ "$DRY_RUN" -eq 0 ]]; then
-            ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION"
+            ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION" "$ARCHIVE_URL"
             git add -- "$FORMULA_FILE"
             if [[ -n "$VERSION_FILE" ]]; then
                 update_version_file "$VERSION_FILE" "$VERSION_KEY" "$NEW_VERSION"
@@ -1580,12 +1480,11 @@ main() {
     if [[ "$SKIP_TAP_AUDIT" -eq 0 ]]; then
         log "运行 brew style --fix / brew audit（提交 Tap 之前）"
         if [[ "$DRY_RUN" -eq 0 ]]; then
-            brew style --fix --except-cops="FormulaAuditStrict,FormulaAudit/ComponentsOrder" "$TAP_FORMULA_PATH" || warn "brew style 未完全通过，请人工检查"
-            protect_interpolated_version "$TAP_FORMULA_PATH"
-            brew audit --except-cops="FormulaAuditStrict,FormulaAudit/ComponentsOrder" "${TAP_SHORT}/${FORMULA_NAME}" || warn "brew audit 未完全通过，请人工检查"
+            brew style --fix "$TAP_FORMULA_PATH" || warn "brew style 未完全通过，请人工检查"
+            brew audit "${TAP_SHORT}/${FORMULA_NAME}" || warn "brew audit 未完全通过，请人工检查"
         else
-            run_cmd brew style --fix --except-cops="FormulaAuditStrict,FormulaAudit/ComponentsOrder" "$TAP_FORMULA_PATH"
-            run_cmd brew audit --except-cops="FormulaAuditStrict,FormulaAudit/ComponentsOrder" "${TAP_SHORT}/${FORMULA_NAME}"
+            run_cmd brew style --fix "$TAP_FORMULA_PATH"
+            run_cmd brew audit "${TAP_SHORT}/${FORMULA_NAME}"
         fi
     else
         warn "已跳过 brew style / brew audit"

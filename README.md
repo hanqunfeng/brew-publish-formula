@@ -90,7 +90,7 @@ tag_prefix=v
 https://github.com/<owner>/<repo>/archive/refs/tags/vX.Y.Z.tar.gz
 ```
 
-`version` 要写在 `url` 前面，地址才能引用它，例如 `v#{version}`。`brew style` 默认会把 `url` 移到 `version` 前面，这时 `#{version}` 还是空的，下载地址会变成 `v.tar.gz`。发布命令检查公式时会跳过 `FormulaAudit/ComponentsOrder`，并在检查后把 `version` 放回 `url` 前面。发布时如果 `url` 已经这样写，脚本会保留这行，只更新 `version` 和 `sha256`。
+`url` 里直接写 tag，例如 `v1.2.3`。`version` 写在 `url` 后面，和 Homebrew 的字段顺序一致。发布时会把这两处一起改成新版本，并更新 `sha256`。
 
 版本号优先取最新的语义化 tag。没有 tag 时，若配置了 `version_file` 就读该文件，否则读 formula 的 `version`。都没有时按 `0.0.0` 递增。第一次打 tag 可以用 `--version` 指定版本，不必先有历史 tag。
 

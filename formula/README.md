@@ -99,8 +99,8 @@ $(brew --repo hanqunfeng/homebrew-tap)/Formula/brew-publish-formula.rb
 提交前可以检查整个 Tap：
 
 ```bash
-brew style --fix --except-cops=FormulaAuditStrict,FormulaAudit/ComponentsOrder hanqunfeng/tap
-brew audit --except-cops=FormulaAuditStrict,FormulaAudit/ComponentsOrder --tap=hanqunfeng/tap
+brew style --fix hanqunfeng/tap
+brew audit --tap=hanqunfeng/tap
 ```
 
 发布命令默认只检查当前这份 formula。
@@ -113,9 +113,8 @@ brew audit --except-cops=FormulaAuditStrict,FormulaAudit/ComponentsOrder --tap=h
 class BrewPublishFormula < Formula
   desc "Publish project releases to a Homebrew tap"
   homepage "https://github.com/hanqunfeng/brew-publish-formula"
-  # version 必须写在 url 前面，#{version} 才会被替换。
+  url "https://github.com/hanqunfeng/brew-publish-formula/archive/refs/tags/v0.1.0.tar.gz"
   version "0.1.0"
-  url "https://github.com/hanqunfeng/brew-publish-formula/archive/refs/tags/v#{version}.tar.gz"
   sha256 "..."
   license "MIT"
 
@@ -161,8 +160,8 @@ cp formula/brew-publish-formula.rb \
   "$(brew --repo hanqunfeng/homebrew-tap)/Formula/"
 
 cd "$(brew --repo hanqunfeng/homebrew-tap)"
-brew style --fix --except-cops=FormulaAuditStrict,FormulaAudit/ComponentsOrder hanqunfeng/tap/brew-publish-formula
-brew audit --except-cops=FormulaAuditStrict,FormulaAudit/ComponentsOrder hanqunfeng/tap/brew-publish-formula
+brew style --fix hanqunfeng/tap/brew-publish-formula
+brew audit hanqunfeng/tap/brew-publish-formula
 git add Formula/brew-publish-formula.rb
 git commit -m "brew-publish-formula v0.1.0"
 git push
