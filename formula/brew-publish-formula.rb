@@ -3,7 +3,7 @@
 class BrewPublishFormula < Formula
   desc "Install brew-publish-formula"
   homepage "https://github.com/hanqunfeng/brew-publish-formula"
-  url "https://github.com/hanqunfeng/brew-publish-formula/archive/refs/tags/v0.1.4.tar.gz"
+  url "https://github.com/hanqunfeng/brew-publish-formula/archive/refs/tags/v0.1.5.tar.gz"
   sha256 "eb3bf3588b6c0d040d168fb1be60919e544519b69fde05d340c47aac64a7e304"
   license "MIT"
 
