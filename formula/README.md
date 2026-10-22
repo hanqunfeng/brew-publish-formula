@@ -52,7 +52,7 @@ brew-publish-formula minor
 brew-publish-formula major
 ```
 
-[`brew-publish.conf`](brew-publish.conf) 指定了 Tap 和 formula。发布版本写在 formula 的 `version` 属性中。
+[`brew-publish.conf`](brew-publish.conf) 指定了 Tap 和 formula。发布版本写在 formula 的 `url` 里。
 
 发布前检查：
 
@@ -114,7 +114,6 @@ class BrewPublishFormula < Formula
   desc "Publish project releases to a Homebrew tap"
   homepage "https://github.com/hanqunfeng/brew-publish-formula"
   url "https://github.com/hanqunfeng/brew-publish-formula/archive/refs/tags/v0.1.0.tar.gz"
-  version "0.1.0"
   sha256 "..."
   license "MIT"
 
@@ -152,7 +151,7 @@ curl -L -o v0.1.0.tar.gz \
 shasum -a 256 v0.1.0.tar.gz
 ```
 
-把得到的地址和哈希写入 `formula/brew-publish-formula.rb`，并把同一文件里的 `version` 改成对应版本。然后：
+把得到的地址和哈希写入 `formula/brew-publish-formula.rb`。地址里的 tag 就是版本，不要再写一行相同的 `version`。然后：
 
 ```bash
 ruby -c formula/brew-publish-formula.rb

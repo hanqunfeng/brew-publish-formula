@@ -15,7 +15,7 @@
 #   4. 从 origin 解析 GitHub 仓库，定位 formula/*.rb
 #   5. 根据最新 git tag + bump 类型计算新版本，或使用 --version
 #   6. 运行项目检查脚本（默认 scripts/check.sh；本仓库直接 shellcheck 主文件，可用 --skip-check 跳过）
-#   7. 更新 formula 的 version 属性（若配置了 version_file，同时更新该文件），提交并推送，创建 annotated tag（如 v1.0.6）
+#   7. 更新 formula 的 url（若配置了 version_file，同时更新该文件），提交并推送，创建 annotated tag（如 v1.0.6）
 #   8. 下载该 tag 的 GitHub 源码包并计算 sha256
 #   9. 更新 formula 的 url / sha256，提交并推送项目仓库
 #  10. 将 formula 复制到本地 Tap，执行 brew style / brew audit
@@ -39,7 +39,7 @@
 # 项目配置（formula/brew-publish.conf）示例:
 #   tap=hanqunfeng/homebrew-tap
 #   formula=formula/java-project-generator.rb
-#   version_file=springboot          # 可选；省略时使用 formula 的 version 属性
+#   version_file=springboot          # 可选；省略时从 formula 的 url 读取版本
 #   version_key=SCRIPT_VERSION       # 与 version_file 成对出现
 #   check=scripts/check.sh
 #   tag_prefix=v
@@ -78,7 +78,7 @@
 #   间隔从 3 秒起，每次失败增加 2 秒。权限不足、推送被拒绝这类错误不会重试。
 # =============================================================================
 
-# 命令自身在 --help 中显示的版本。发布本仓库时会随 formula 的 version 属性一起更新。
+# 命令自身在 --help 中显示的版本。发布本仓库时会随新版本一起更新。
 TOOL_VERSION="0.1.4"
 
 # 连接 GitHub 失败时的重试次数，以及第一次失败后的等待秒数。之后每次再加 2 秒。
@@ -335,36 +335,92 @@ count_formula_lines() {
     awk -v pattern="$pattern" 'BEGIN { n = 0 } $0 ~ pattern { n++ } END { print n }' "$file"
 }
 
-# 读取 formula 中独立的 version "X.Y.Z"。没有该属性时返回 1。
+count_toplevel_version_lines() {
+    local file="$1"
+    awk '
+        BEGIN { n = 0; indent = "" }
+        $0 ~ /^[[:space:]]*url[[:space:]]+"/ && indent == "" {
+            match($0, /^[[:space:]]*/)
+            indent = substr($0, 1, RLENGTH)
+        }
+        {
+            lines[NR] = $0
+        }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (indent != "" && index(lines[i], indent "version \"") == 1) {
+                    n++
+                }
+            }
+            print n
+        }
+    ' "$file"
+}
+
+# 读取 formula 里的版本。优先用与 url 同层的 version "X.Y.Z"；没有该行时从 url 的 tag 中取。
 read_formula_version() {
     local file="$1"
-    local value count
+    local value count tag
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
-    count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
-    if [[ "$count" -eq 0 ]]; then
-        return 1
-    fi
+    count="$(count_toplevel_version_lines "$file")"
     if [[ "$count" -gt 1 ]]; then
         die "formula 里只能有一个 version 属性: $file"
     fi
-    value="$(
+    if [[ "$count" -eq 1 ]]; then
+        value="$(
+            awk '
+                BEGIN { indent = "" }
+                $0 ~ /^[[:space:]]*url[[:space:]]+"/ && indent == "" {
+                    match($0, /^[[:space:]]*/)
+                    indent = substr($0, 1, RLENGTH)
+                }
+                {
+                    lines[NR] = $0
+                }
+                END {
+                    for (i = 1; i <= NR; i++) {
+                        if (indent != "" && index(lines[i], indent "version \"") == 1) {
+                            if (match(lines[i], /"[0-9]+\.[0-9]+\.[0-9]+"/)) {
+                                print substr(lines[i], RSTART + 1, RLENGTH - 2)
+                                exit
+                            }
+                        }
+                    }
+                }
+            ' "$file"
+        )"
+        if [[ -z "$value" ]]; then
+            die "formula 的 version 不是 X.Y.Z: $file"
+        fi
+        printf '%s\n' "$value"
+        return 0
+    fi
+    tag="$(
         awk '
-            $0 ~ /^[[:space:]]*version[[:space:]]+"/ {
-                if (match($0, /"[0-9]+\.[0-9]+\.[0-9]+"/)) {
-                    print substr($0, RSTART + 1, RLENGTH - 2)
+            $0 ~ /^[[:space:]]*url[[:space:]]+"/ {
+                if (match($0, /refs\/tags\/[^"]+\.tar\.gz/)) {
+                    text = substr($0, RSTART, RLENGTH)
+                    sub(/^refs\/tags\//, "", text)
+                    sub(/\.tar\.gz$/, "", text)
+                    print text
                     exit
                 }
             }
         ' "$file"
     )"
-    if [[ -z "$value" ]]; then
-        die "formula 的 version 不是 X.Y.Z: $file"
+    if [[ -z "$tag" ]]; then
+        return 1
     fi
-    printf '%s\n' "$value"
+    if [[ -n "${TAG_PREFIX:-}" && "$tag" == "$TAG_PREFIX"* ]]; then
+        tag="${tag#"$TAG_PREFIX"}"
+    fi
+    if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$tag"
 }
 
-# 写入或插入 formula 的 version 属性，不改 url / sha256。
-# 把 url 写成具体地址，并把 version 放到 url 后面，符合 Homebrew 的字段顺序。
+# 把 url 写成具体 tag 地址。地址里已经包含版本时，删掉多余的 version 行。
 rewrite_formula_fields() {
     local file="$1"
     local version="$2"
@@ -374,45 +430,52 @@ rewrite_formula_fields() {
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
     tmp="$(mktemp)"
     awk -v url="$url" -v hash="$hash" -v ver="$version" '
-        BEGIN { url_done = 0; sha_done = 0; ver_done = 0 }
+        BEGIN { n = 0; url_i = 0; indent = "" }
         {
-            if ($0 ~ /^[[:space:]]*# version 必须写在 url 前面/) {
-                next
-            }
-            if ($0 ~ /^[[:space:]]*# rubocop:(disable|enable) FormulaAudit\/ComponentsOrder[[:space:]]*$/) {
-                next
-            }
-            if ($0 ~ /^[[:space:]]*version[[:space:]]+"/) {
-                next
-            }
-            if (url_done == 0 && $0 ~ /^[[:space:]]*url[[:space:]]+"/) {
+            n++
+            lines[n] = $0
+            if (url_i == 0 && $0 ~ /^[[:space:]]*url[[:space:]]+"/) {
+                url_i = n
                 match($0, /^[[:space:]]*/)
                 indent = substr($0, 1, RLENGTH)
-                if (url != "") {
-                    print indent "url \"" url "\""
-                } else {
-                    line = $0
-                    gsub(/#\{version\}/, ver, line)
-                    print line
-                }
-                print indent "version \"" ver "\""
-                url_done = 1
-                ver_done = 1
-                next
             }
-            if (hash != "" && sha_done == 0 && $0 ~ /^[[:space:]]*sha256[[:space:]]+"/) {
-                match($0, /^[[:space:]]*/)
-                indent = substr($0, 1, RLENGTH)
-                print indent "sha256 \"" hash "\""
-                sha_done = 1
-                next
-            }
-            print
         }
         END {
+            if (url_i == 0) exit 2
+            url_done = 0
+            sha_done = 0
+            for (i = 1; i <= n; i++) {
+                if (lines[i] ~ /^[[:space:]]*# version 必须写在 url 前面/) {
+                    continue
+                }
+                if (lines[i] ~ /^[[:space:]]*# rubocop:(disable|enable) FormulaAudit\/ComponentsOrder[[:space:]]*$/) {
+                    continue
+                }
+                if (index(lines[i], indent "version \"") == 1) {
+                    continue
+                }
+                if (i == url_i) {
+                    if (url != "") {
+                        print indent "url \"" url "\""
+                    } else {
+                        line = lines[i]
+                        gsub(/#\{version\}/, ver, line)
+                        print line
+                    }
+                    url_done = 1
+                    continue
+                }
+                if (hash != "" && sha_done == 0 && lines[i] ~ /^[[:space:]]*sha256[[:space:]]+"/) {
+                    match(lines[i], /^[[:space:]]*/)
+                    sha_indent = substr(lines[i], 1, RLENGTH)
+                    print sha_indent "sha256 \"" hash "\""
+                    sha_done = 1
+                    continue
+                }
+                print lines[i]
+            }
             if (url_done == 0) exit 2
             if (hash != "" && sha_done == 0) exit 3
-            if (ver_done == 0) exit 4
         }
     ' "$file" > "$tmp" && awk_status=0 || awk_status=$?
     if [[ "$awk_status" -ne 0 ]]; then
@@ -428,29 +491,25 @@ ensure_formula_version() {
     local url="$3"
     local count
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
-    count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
+    count="$(count_toplevel_version_lines "$file")"
     if [[ "$count" -gt 1 ]]; then
         die "formula 里只能有一个 version 属性: $file"
     fi
     rewrite_formula_fields "$file" "$version" "$url" ""
 }
 
-# 更新顶层 url、sha256，并保证 version 紧跟在 url 后面。
+# 更新顶层 url 与 sha256。url 中已含版本时去掉多余的 version 行。
 update_formula_file() {
     local file="$1"
     local url="$2"
     local hash="$3"
     local version="$4"
-    local url_count sha_count ver_count
+    local url_count sha_count
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
     url_count="$(count_formula_lines "$file" '^[[:space:]]*url[[:space:]]+"')"
     sha_count="$(count_formula_lines "$file" '^[[:space:]]*sha256[[:space:]]+"')"
-    ver_count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
     if [[ "$url_count" -ne 1 || "$sha_count" -ne 1 ]]; then
         die "formula 需要且只能有一对顶层 url 与 sha256（当前 url=${url_count} sha256=${sha_count}）: $file"
-    fi
-    if [[ "$ver_count" -gt 1 ]]; then
-        die "formula 里只能有一个 version 属性: $file"
     fi
     rewrite_formula_fields "$file" "$version" "$url" "$hash"
 }
@@ -819,11 +878,11 @@ detect_current_version() {
         return 0
     fi
     if version="$(read_formula_version "$FORMULA_FILE")"; then
-        warn "未找到 git tag，改用 ${FORMULA_FILE} 的 version=${version}"
+        warn "未找到 git tag，改用 ${FORMULA_FILE} 中的版本 ${version}"
         CURRENT_VERSION="$version"
         return 0
     fi
-    warn "未找到 git tag 或 formula 的 version 属性，当前版本按 0.0.0 处理"
+    warn "未找到 git tag，也没有从 formula 的 url 读到版本，当前版本按 0.0.0 处理"
     CURRENT_VERSION="0.0.0"
 }
 
@@ -1142,7 +1201,7 @@ sync_formula_contents() {
     local version="$1"
     local hash="$2"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        printf '[dry-run] 更新 %s 的 url、sha256 和 version → %s\n' "$FORMULA_FILE" "$hash"
+        printf '[dry-run] 更新 %s 的 url 与 sha256 → %s\n' "$FORMULA_FILE" "$hash"
         if [[ -n "$VERSION_FILE" ]]; then
             printf '[dry-run] 更新 %s 的 %s → %s\n' "$VERSION_FILE" "$VERSION_KEY" "$version"
         fi
@@ -1227,7 +1286,6 @@ class ${class_name} < Formula
   desc "Install ${formula_name}"
   homepage "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}"
   url "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/archive/refs/tags/${TAG_PREFIX}${version}.tar.gz"
-  version "${version}"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
@@ -1388,7 +1446,7 @@ main() {
         if [[ -n "$VERSION_FILE" ]]; then
             log "更新 ${VERSION_FILE} 中的 ${VERSION_KEY} → ${NEW_VERSION}"
         else
-            log "更新 ${FORMULA_FILE} 的 version → ${NEW_VERSION}"
+            log "更新 ${FORMULA_FILE} 的 url → ${ARCHIVE_URL}"
         fi
         if [[ "$DRY_RUN" -eq 0 ]]; then
             ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION" "$ARCHIVE_URL"
@@ -1402,7 +1460,7 @@ main() {
             fi
             commit_if_staged "chore: bump version to ${NEW_VERSION}"
         else
-            printf '[dry-run] 更新 %s 的 version → %s\n' "$FORMULA_FILE" "$NEW_VERSION"
+            printf '[dry-run] 更新 %s 的 url → %s\n' "$FORMULA_FILE" "$ARCHIVE_URL"
             run_cmd git add -- "$FORMULA_FILE"
             if [[ -n "$VERSION_FILE" ]]; then
                 printf '[dry-run] 更新 %s 的 %s → %s\n' "$VERSION_FILE" "$VERSION_KEY" "$NEW_VERSION"

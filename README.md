@@ -79,7 +79,7 @@ tag_prefix=v
 | --- | --- |
 | `tap` | `user/homebrew-tap` 或 `user/tap`。发布前会检查本地是否已有该 Tap；没有则先执行 `brew tap-new user/homebrew-tap` |
 | `formula` | formula 相对路径。省略时，`formula/` 下只能有一个 `*.rb` |
-| `version_file` | 可选。项目里另有版本号时，发布会改写该文件。省略则使用 formula 的 `version` 属性 |
+| `version_file` | 可选。项目里另有版本号时，发布会改写该文件。省略则从 formula 的 `url` 读取版本 |
 | `version_key` | 与 `version_file` 成对出现。匹配整行 `KEY="X.Y.Z"`。两项都省略时不需要 |
 | `check` | 可选。检查脚本路径；`none` 表示不检查。省略时若存在 `scripts/check.sh` 就执行它 |
 | `tag_prefix` | 可选，默认 `v`，生成 `v1.2.3` |
@@ -90,9 +90,9 @@ tag_prefix=v
 https://github.com/<owner>/<repo>/archive/refs/tags/vX.Y.Z.tar.gz
 ```
 
-`url` 里直接写 tag，例如 `v1.2.3`。`version` 写在 `url` 后面，和 Homebrew 的字段顺序一致。发布时会把这两处一起改成新版本，并更新 `sha256`。
+`url` 里直接写 tag，例如 `v1.2.3`。Homebrew 会从这段地址识别版本，所以公式里不再单独写 `version`。再写一行相同的 `version` 时，`brew audit` 会报 redundant。发布时会把 `url` 里的 tag 改成新版本，并更新 `sha256`。
 
-版本号优先取最新的语义化 tag。没有 tag 时，若配置了 `version_file` 就读该文件，否则读 formula 的 `version`。都没有时按 `0.0.0` 递增。第一次打 tag 可以用 `--version` 指定版本，不必先有历史 tag。
+版本号优先取最新的语义化 tag。没有 tag 时，若配置了 `version_file` 就读该文件，否则从 formula 的 `url` 读取。都没有时按 `0.0.0` 递增。第一次打 tag 可以用 `--version` 指定版本，不必先有历史 tag。
 
 ## 发布
 
