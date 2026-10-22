@@ -1,0 +1,1604 @@
+#!/usr/bin/env bash
+# =============================================================================
+# brew-publish-formula — 把当前项目的新版本发布到 Homebrew Tap
+#
+# 在要发布的项目根目录中执行。当前工作目录就是项目根目录。
+# 脚本在这个目录读取配置、formula 和 git 信息。
+#
+# 因此本命令可以克隆后加入 PATH，从 GitHub 安装使用；
+# 发布到 Tap 之后，也可以用 Homebrew 安装，再对任意项目执行。
+#
+# 完整流程：
+#   1. 确认当前目录是 git 仓库根目录（--help 除外）
+#   2. 确认项目中存在 formula/brew-publish.conf（或 .brew-publish.conf / --config）
+#   3. 确认配置中的 Homebrew Tap 已在本地存在，否则提示先创建
+#   4. 从 origin 解析 GitHub 仓库，定位 formula/*.rb
+#   5. 根据最新 git tag + bump 类型计算新版本，或使用 --version
+#   6. 运行项目检查脚本（默认 scripts/check.sh；本仓库直接 shellcheck 主文件，可用 --skip-check 跳过）
+#   7. 更新 formula 的 version 属性（若配置了 version_file，同时更新该文件），提交并推送，创建 annotated tag（如 v1.0.6）
+#   8. 下载该 tag 的 GitHub 源码包并计算 sha256
+#   9. 更新 formula 的 url / sha256，提交并推送项目仓库
+#  10. 将 formula 复制到本地 Tap，执行 brew style / brew audit
+#  11. 若 style 改写了 formula，回同步到项目仓库
+#  12. 提交并推送 Tap
+#
+# 用法:
+#   brew-publish-formula <patch|minor|major> [选项]
+#   brew-publish-formula --version 1.2.0 [选项]
+#   brew-publish-formula --resume 1.0.6 [选项]
+#
+# 示例:
+#   brew-publish-formula patch
+#   brew-publish-formula minor --yes
+#   brew-publish-formula --version 1.2.0
+#   brew-publish-formula --resume 1.0.6 --yes
+#   brew-publish-formula patch --dry-run
+#   brew-publish-formula patch --skip-check --yes
+#   brew-publish-formula --init
+#
+# 项目配置（formula/brew-publish.conf）示例:
+#   tap=hanqunfeng/homebrew-tap
+#   formula=formula/java-project-generator.rb
+#   version_file=springboot          # 可选；省略时使用 formula 的 version 属性
+#   version_key=SCRIPT_VERSION       # 与 version_file 成对出现
+#   check=scripts/check.sh
+#   tag_prefix=v
+#
+# 选项:
+#   --config FILE       指定配置文件
+#   --tap USER/REPO     覆盖配置中的 tap（user/tap 或 user/homebrew-tap）
+#   --formula PATH      覆盖 formula 相对路径
+#   --version-file PATH 覆盖版本文件相对路径
+#   --version-key KEY   覆盖版本赋值的变量名，匹配整行 KEY="X.Y.Z"
+#   --check PATH        覆盖检查脚本；none 表示不检查
+#   --tag-prefix PFX    覆盖 tag 前缀，默认 v
+#   --dry-run           只打印计划，不修改文件、不推送
+#   --yes, -y           跳过交互确认
+#   --skip-check        跳过检查脚本
+#   --skip-tap-audit    跳过 brew style / brew audit
+#   --no-push           不推送远程（无法完成 sha256 与 Tap 发布）
+#   --resume X.Y.Z      tag 已推送时从计算 sha256 继续
+#   --init              缺少配置时生成 formula/brew-publish.conf；
+#                       formula/ 下没有 .rb 时一并生成 formula 模板。独立命令，不发布
+#   -h, --help          显示本说明
+#
+# 前置条件:
+#   - 当前目录是 git 仓库根目录
+#   - 全量发布时工作区干净；--resume 时只允许 formula 和版本文件已修改
+#   - origin 指向 GitHub 仓库，并且有 push 权限
+#   - 本地已经存在要发布到的 Tap。没有时请先执行 brew tap-new user/homebrew-repo
+#   - formula 里只有一对顶层 url 与 sha256
+#   - 已安装 git、curl、ruby、brew，以及 shasum 或 sha256sum
+#
+# 说明:
+#   tag 对应的源码包哈希要等 tag 推上 GitHub 才能计算，因此 formula 的
+#   sha256 提交落在 tag 之后。Homebrew 安装使用 Tap 仓库里的 formula。
+#   项目仓库中的 formula/ 是同步源。
+#   连接 GitHub 的 git push、git ls-remote 和源码包下载都会重试，最多 8 次，
+#   间隔从 3 秒起，每次失败增加 2 秒。权限不足、推送被拒绝这类错误不会重试。
+# =============================================================================
+
+# 命令自身在 --help 中显示的版本。发布本仓库时会随 formula 的 version 属性一起更新。
+TOOL_VERSION="0.1.0"
+
+# 连接 GitHub 失败时的重试次数，以及第一次失败后的等待秒数。之后每次再加 2 秒。
+GITHUB_RETRY_ATTEMPTS=8
+GITHUB_RETRY_INITIAL_DELAY=3
+
+# 日志走 stderr，避免污染 $(...) 的返回值。
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    awk '
+        NR == 1 { next }
+        /^# =+$/ && seen_title { exit }
+        /^# =+$/ { seen_title = 1; next }
+        /^#/ {
+            sub(/^# ?/, "")
+            print
+            next
+        }
+        { exit }
+    ' "$0"
+    printf '\n当前命令版本: %s\n' "$TOOL_VERSION"
+    exit "${1:-0}"
+}
+
+# 去掉首尾空白。
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s\n' "$s"
+}
+
+# 只接受 X.Y.Z 或 vX.Y.Z。
+normalize_version() {
+    local raw="$1"
+    raw="${raw#v}"
+    if [[ ! "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        die "非法版本号: $1（期望格式: X.Y.Z 或 vX.Y.Z）"
+    fi
+    printf '%s\n' "$raw"
+}
+
+# 按数值比较语义化版本。a < b 时返回 0。
+version_lt() {
+    local a="$1" b="$2"
+    local IFS=.
+    local -a aa bb
+    local i av bv
+    read -r -a aa <<< "$a"
+    read -r -a bb <<< "$b"
+    for ((i = 0; i < 3; i++)); do
+        av=$((10#${aa[i]:-0}))
+        bv=$((10#${bb[i]:-0}))
+        if ((av < bv)); then
+            return 0
+        fi
+        if ((av > bv)); then
+            return 1
+        fi
+    done
+    return 1
+}
+
+# patch: 1.0.5 → 1.0.6；minor: 1.0.5 → 1.1.0；major: 1.0.5 → 2.0.0。
+bump_version() {
+    local current="$1"
+    local bump="$2"
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "$current"
+    case "$bump" in
+        patch) patch=$((10#$patch + 1)) ;;
+        minor) minor=$((10#$minor + 1)); patch=0 ;;
+        major) major=$((10#$major + 1)); minor=0; patch=0 ;;
+        *) die "未知 bump 类型: $bump（支持: patch | minor | major）" ;;
+    esac
+    printf '%s.%s.%s\n' "$major" "$minor" "$patch"
+}
+
+# 解析 GitHub 远程地址，向 stdout 输出 owner、repo 两行。
+parse_github_remote() {
+    local url="$1"
+    url="${url%.git}"
+    url="${url%/}"
+    if [[ "$url" =~ github\.com[:/]([^/:]+)/([^/]+)$ ]]; then
+        printf '%s\n%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+# user/tap 与 user/homebrew-tap 都归一成 TAP_FULL / TAP_SHORT。
+normalize_tap() {
+    local tap="$1"
+    local user repo
+    if [[ ! "$tap" =~ ^([^/]+)/([^/]+)$ ]]; then
+        die "tap 格式应为 user/repo 或 user/homebrew-repo: $tap"
+    fi
+    user="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+    if [[ "$repo" == homebrew-* ]]; then
+        TAP_FULL="${user}/${repo}"
+        TAP_SHORT="${user}/${repo#homebrew-}"
+    else
+        TAP_FULL="${user}/homebrew-${repo}"
+        TAP_SHORT="${user}/${repo}"
+    fi
+}
+
+# 仓库内相对路径：去掉 ./，拒绝绝对路径和 ..。
+normalize_repo_path() {
+    local path="$1"
+    local label="$2"
+    path="$(trim "$path")"
+    path="${path#./}"
+    if [[ -z "$path" ]]; then
+        die "${label} 路径为空"
+    fi
+    case "$path" in
+        /*) die "${label} 请使用仓库内相对路径: $path" ;;
+    esac
+    case "/${path}/" in
+        */../*) die "${label} 路径不能包含 .. : $path" ;;
+    esac
+    printf '%s\n' "$path"
+}
+
+# 读取 KEY=VALUE 配置。未知键直接失败，避免拼写错误被静默忽略。
+load_config_file() {
+    local file="$1"
+    local line key value
+    CFG_TAP=""
+    CFG_FORMULA=""
+    CFG_VERSION_FILE=""
+    CFG_VERSION_KEY=""
+    CFG_CHECK=""
+    CFG_TAG_PREFIX=""
+    CFG_HAS_CHECK=0
+    CFG_HAS_TAG_PREFIX=0
+    [[ -f "$file" ]] || die "配置文件不存在: $file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        if [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]]; then
+            continue
+        fi
+        if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            die "配置行无法解析: $line"
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="$(trim "${BASH_REMATCH[2]}")"
+        if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+        case "$key" in
+            tap) CFG_TAP="$value" ;;
+            formula) CFG_FORMULA="$value" ;;
+            version_file) CFG_VERSION_FILE="$value" ;;
+            version_key) CFG_VERSION_KEY="$value" ;;
+            check)
+                CFG_CHECK="$value"
+                CFG_HAS_CHECK=1
+                ;;
+            tag_prefix)
+                CFG_TAG_PREFIX="$value"
+                CFG_HAS_TAG_PREFIX=1
+                ;;
+            *) die "未知配置项: $key" ;;
+        esac
+    done < "$file"
+}
+
+file_mode() {
+    local mode
+    mode="$(stat -f '%OLp' "$1" 2>/dev/null || true)"
+    if [[ "$mode" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$mode"
+        return 0
+    fi
+    stat -c '%a' "$1"
+}
+
+# mktemp 产物默认不可执行。覆盖脚本前要恢复原权限。
+replace_file_preserving_mode() {
+    local dest="$1"
+    local tmp="$2"
+    local mode
+    mode="$(file_mode "$dest")"
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$dest"
+}
+
+# 把 KEY="旧版本" 整行替换为 KEY="新版本"，保留行首缩进。
+update_version_file() {
+    local file="$1"
+    local key="$2"
+    local version="$3"
+    local tmp awk_status
+    [[ -f "$file" ]] || die "版本文件不存在: $file"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        die "version_key 只能包含字母、数字和下划线: $key"
+    fi
+    tmp="$(mktemp)"
+    awk -v key="$key" -v ver="$version" '
+        BEGIN { found = 0 }
+        {
+            if (found == 0 && $0 ~ "^[[:space:]]*" key "=\"") {
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, 1, RLENGTH)
+                print indent key "=\"" ver "\""
+                found = 1
+            } else {
+                print
+            }
+        }
+        END { if (found == 0) exit 2 }
+    ' "$file" > "$tmp" && awk_status=0 || awk_status=$?
+    if [[ "$awk_status" -eq 2 ]]; then
+        rm -f "$tmp"
+        die "在 ${file} 中找不到 ${key}=\"...\""
+    fi
+    if [[ "$awk_status" -ne 0 ]]; then
+        rm -f "$tmp"
+        die "更新版本文件失败: $file"
+    fi
+    replace_file_preserving_mode "$file" "$tmp"
+}
+
+read_version_from_file() {
+    local file="$1"
+    local key="$2"
+    local value
+    [[ -f "$file" ]] || die "版本文件不存在: $file"
+    value="$(
+        awk -v key="$key" '
+            $0 ~ "^[[:space:]]*" key "=\"" {
+                if (match($0, /"[0-9]+\.[0-9]+\.[0-9]+"/)) {
+                    print substr($0, RSTART + 1, RLENGTH - 2)
+                    exit
+                }
+            }
+        ' "$file"
+    )"
+    if [[ -z "$value" ]]; then
+        die "无法从 ${file} 的 ${key} 读取版本号"
+    fi
+    printf '%s\n' "$value"
+}
+
+count_formula_lines() {
+    local file="$1"
+    local pattern="$2"
+    awk -v pattern="$pattern" 'BEGIN { n = 0 } $0 ~ pattern { n++ } END { print n }' "$file"
+}
+
+# 读取 formula 中独立的 version "X.Y.Z"。没有该属性时返回 1。
+read_formula_version() {
+    local file="$1"
+    local value count
+    [[ -f "$file" ]] || die "formula 文件不存在: $file"
+    count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
+    if [[ "$count" -eq 0 ]]; then
+        return 1
+    fi
+    if [[ "$count" -gt 1 ]]; then
+        die "formula 里只能有一个 version 属性: $file"
+    fi
+    value="$(
+        awk '
+            $0 ~ /^[[:space:]]*version[[:space:]]+"/ {
+                if (match($0, /"[0-9]+\.[0-9]+\.[0-9]+"/)) {
+                    print substr($0, RSTART + 1, RLENGTH - 2)
+                    exit
+                }
+            }
+        ' "$file"
+    )"
+    if [[ -z "$value" ]]; then
+        die "formula 的 version 不是 X.Y.Z: $file"
+    fi
+    printf '%s\n' "$value"
+}
+
+# 写入或插入 formula 的 version 属性，不改 url / sha256。
+ensure_formula_version() {
+    local file="$1"
+    local version="$2"
+    local count tmp awk_status insert
+    [[ -f "$file" ]] || die "formula 文件不存在: $file"
+    count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
+    if [[ "$count" -gt 1 ]]; then
+        die "formula 里只能有一个 version 属性: $file"
+    fi
+    if [[ "$count" -eq 0 ]]; then
+        insert=1
+    else
+        insert=0
+    fi
+    tmp="$(mktemp)"
+    awk -v ver="$version" -v insert="$insert" '
+        BEGIN { done = 0; skip_old = 0 }
+        {
+            if (done == 0 && $0 ~ /^[[:space:]]*url[[:space:]]+"/ && $0 ~ /#\{version\}/) {
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, 1, RLENGTH)
+                print indent "version \"" ver "\""
+                print
+                done = 1
+                skip_old = 1
+                next
+            }
+            if (skip_old == 1 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
+                next
+            }
+            if (done == 0 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, 1, RLENGTH)
+                print indent "version \"" ver "\""
+                done = 1
+                next
+            }
+            if (insert == 1 && done == 0 && $0 ~ /^[[:space:]]*sha256[[:space:]]+"/) {
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, 1, RLENGTH)
+                print indent "version \"" ver "\""
+                done = 1
+                print
+                next
+            }
+            print
+        }
+        END { if (done == 0) exit 2 }
+    ' "$file" > "$tmp" && awk_status=0 || awk_status=$?
+    if [[ "$awk_status" -ne 0 ]]; then
+        rm -f "$tmp"
+        die "无法写入 formula 的 version 属性: $file"
+    fi
+    replace_file_preserving_mode "$file" "$tmp"
+}
+
+# 更新顶层 url、sha256，并保证有且只有一个 version 属性。
+update_formula_file() {
+    local file="$1"
+    local url="$2"
+    local hash="$3"
+    local version="$4"
+    local tmp awk_status url_count sha_count ver_count insert
+    [[ -f "$file" ]] || die "formula 文件不存在: $file"
+    url_count="$(count_formula_lines "$file" '^[[:space:]]*url[[:space:]]+"')"
+    sha_count="$(count_formula_lines "$file" '^[[:space:]]*sha256[[:space:]]+"')"
+    ver_count="$(count_formula_lines "$file" '^[[:space:]]*version[[:space:]]+"')"
+    if [[ "$url_count" -ne 1 || "$sha_count" -ne 1 ]]; then
+        die "formula 需要且只能有一对顶层 url 与 sha256（当前 url=${url_count} sha256=${sha_count}）: $file"
+    fi
+    if [[ "$ver_count" -gt 1 ]]; then
+        die "formula 里只能有一个 version 属性: $file"
+    fi
+    if [[ "$ver_count" -eq 0 ]]; then
+        insert=1
+    else
+        insert=0
+    fi
+    tmp="$(mktemp)"
+    awk -v url="$url" -v hash="$hash" -v ver="$version" -v insert="$insert" '
+        BEGIN { url_done = 0; sha_done = 0; ver_done = 0; skip_old_version = 0 }
+        {
+            if (url_done == 0 && $0 ~ /^[[:space:]]*url[[:space:]]+"/) {
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, 1, RLENGTH)
+                if ($0 ~ /#\{version\}/) {
+                    if (ver_done == 0) {
+                        print indent "version \"" ver "\""
+                        ver_done = 1
+                        skip_old_version = 1
+                    }
+                    print
+                } else {
+                    print indent "url \"" url "\""
+                }
+                url_done = 1
+                next
+            }
+            if (skip_old_version == 1 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
+                next
+            }
+            if (ver_done == 0 && $0 ~ /^[[:space:]]*version[[:space:]]+"/) {
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, 1, RLENGTH)
+                print indent "version \"" ver "\""
+                ver_done = 1
+                next
+            }
+            if (sha_done == 0 && $0 ~ /^[[:space:]]*sha256[[:space:]]+"/) {
+                if (insert == 1 && ver_done == 0) {
+                    match($0, /^[[:space:]]*/)
+                    indent = substr($0, 1, RLENGTH)
+                    print indent "version \"" ver "\""
+                    ver_done = 1
+                }
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, 1, RLENGTH)
+                print indent "sha256 \"" hash "\""
+                sha_done = 1
+                next
+            }
+            print
+        }
+        END {
+            if (url_done == 0) exit 2
+            if (sha_done == 0) exit 3
+            if (ver_done == 0) exit 4
+        }
+    ' "$file" > "$tmp" && awk_status=0 || awk_status=$?
+    if [[ "$awk_status" -ne 0 ]]; then
+        rm -f "$tmp"
+        die "更新 formula 失败: $file"
+    fi
+    replace_file_preserving_mode "$file" "$tmp"
+}
+
+archive_is_gzip() {
+    local sig
+    sig="$(od -An -N2 -tx1 "$1" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$sig" == "1f8b" ]]
+}
+
+# GitHub 在 tag 推送后可能短暂不可下载，因此有限次重试。
+compute_archive_sha256() {
+    local tag="$1"
+    local url="$2"
+    local tmp_dir tmp_archive attempt max_attempts sleep_secs hash size
+    max_attempts="$GITHUB_RETRY_ATTEMPTS"
+    sleep_secs="$GITHUB_RETRY_INITIAL_DELAY"
+    tmp_dir="$(mktemp -d)"
+    tmp_archive="${tmp_dir}/${FORMULA_NAME}-${tag}.tar.gz"
+
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        log "下载源码包 (${attempt}/${max_attempts}): ${url}"
+        if curl -fsSL --retry 3 --retry-delay 2 -o "$tmp_archive" "$url"; then
+            size="$(wc -c < "$tmp_archive" | tr -d '[:space:]')"
+            if [[ "$size" -gt 128 ]] && archive_is_gzip "$tmp_archive"; then
+                break
+            fi
+        fi
+        if [[ "$attempt" -eq "$max_attempts" ]]; then
+            rm -rf "$tmp_dir"
+            die "多次重试后仍无法下载 ${url}，请确认 tag 已推送到 GitHub"
+        fi
+        warn "下载失败或文件不是有效的 gzip，${sleep_secs}s 后重试..."
+        sleep "$sleep_secs"
+        sleep_secs=$((sleep_secs + 2))
+    done
+
+    if command -v shasum >/dev/null 2>&1; then
+        hash="$(shasum -a 256 "$tmp_archive" | awk '{ print $1 }')"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        hash="$(sha256sum "$tmp_archive" | awk '{ print $1 }')"
+    else
+        rm -rf "$tmp_dir"
+        die "需要 shasum 或 sha256sum 来计算 sha256"
+    fi
+    rm -rf "$tmp_dir"
+
+    if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+        die "计算出的 sha256 非法: ${hash}"
+    fi
+    printf '%s\n' "$hash"
+}
+
+confirm() {
+    local prompt="$1"
+    local reply
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        die "当前不是交互终端，请追加 --yes 确认发布"
+    fi
+    printf '%s [y/N] ' "$prompt"
+    if ! read -r reply; then
+        die "无法读取确认输入，请使用 --yes"
+    fi
+    [[ "$reply" == "y" || "$reply" == "Y" ]]
+}
+
+run_cmd() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '[dry-run]'
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
+    fi
+    "$@"
+}
+
+# 权限、拒绝推送等结果重试也不会成功。
+github_failure_is_permanent() {
+    local message="$1"
+    local pattern
+    pattern='no upstream branch|Authentication failed|Permission denied|Repository not found|\[rejected\]|failed to push some refs|password authentication was removed|Invalid username or password|could not read Username|hook declined'
+    [[ "$message" =~ $pattern ]]
+}
+
+# 执行一条连接 GitHub 的命令。成功时把标准输出交还给调用方；标准错误原样显示。
+retry_github() {
+    local description="$1"
+    shift
+    local attempt max_attempts sleep_secs output errfile message
+    max_attempts="$GITHUB_RETRY_ATTEMPTS"
+    sleep_secs="$GITHUB_RETRY_INITIAL_DELAY"
+    errfile="$(mktemp)"
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        log "${description} (${attempt}/${max_attempts})"
+        if output="$("$@" 2>"$errfile")"; then
+            if [[ -s "$errfile" ]]; then
+                cat "$errfile" >&2
+            fi
+            rm -f "$errfile"
+            if [[ -n "$output" ]]; then
+                printf '%s\n' "$output"
+            fi
+            return 0
+        fi
+        message="$(cat "$errfile" 2>/dev/null || true)"
+        if [[ -n "$message" ]]; then
+            printf '%s\n' "$message" >&2
+        fi
+        if github_failure_is_permanent "$message"; then
+            rm -f "$errfile"
+            warn "${description} 失败，该错误不会重试"
+            return 1
+        fi
+        if [[ "$attempt" -eq "$max_attempts" ]]; then
+            rm -f "$errfile"
+            return 1
+        fi
+        warn "${description} 失败，${sleep_secs}s 后重试..."
+        sleep "$sleep_secs"
+        sleep_secs=$((sleep_secs + 2))
+    done
+    rm -f "$errfile"
+    return 1
+}
+
+git_push_origin_ref() {
+    local ref="$1"
+    local fail_message="$2"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        run_cmd git push origin "$ref"
+        return 0
+    fi
+    if ! retry_github "推送 ${ref} 到 origin" git push origin "$ref"; then
+        die "$fail_message"
+    fi
+}
+
+git_push_origin_head() {
+    git_push_origin_ref HEAD "推送项目仓库失败。请确认 origin 有权限，且当前分支可以推送"
+}
+
+git_push_origin_tag() {
+    local tag="$1"
+    git_push_origin_ref "$tag" "推送 tag ${tag} 失败。请确认 origin 有权限"
+}
+
+require_tools() {
+    local -a missing
+    local cmd
+    missing=()
+    for cmd in curl ruby brew; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+        missing+=("shasum/sha256sum")
+    fi
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "缺少命令: ${missing[*]}"
+    fi
+}
+
+require_git_root() {
+    local top cwd
+    if ! command -v git >/dev/null 2>&1; then
+        die "未安装 git，无法确认当前目录是 git 仓库根目录"
+    fi
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        die "当前目录不是 git 仓库。请在项目根目录运行 brew-publish-formula"
+    fi
+    top="$(git rev-parse --show-toplevel)"
+    cwd="$(pwd -P)"
+    top="$(cd "$top" && pwd -P)"
+    if [[ "$cwd" != "$top" ]]; then
+        die "当前目录不是 git 仓库根目录。请切换到: $top"
+    fi
+    PROJECT_ROOT="$cwd"
+    if [[ -d "$(git rev-parse --git-path rebase-merge)" \
+        || -d "$(git rev-parse --git-path rebase-apply)" \
+        || -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
+        die "当前仓库处于 rebase 或 merge 中，请先完成后再发布"
+    fi
+    if ! git symbolic-ref --short HEAD >/dev/null 2>&1; then
+        die "当前处于 detached HEAD，请先切回分支再发布"
+    fi
+}
+
+assert_clean_worktree() {
+    if [[ -n "$(git status --porcelain)" ]]; then
+        die "项目工作区不干净。请先提交或清理变更后再发布。
+当前状态:
+$(git status --short)"
+    fi
+}
+
+# 续跑只允许 formula 与版本文件有改动，避免把无关文件提交进发布。
+assert_resume_worktree() {
+    local line path
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        path="${line:3}"
+        case "$path" in
+            *" -> "*) die "续跑时不支持重命名变更: $path" ;;
+        esac
+        if [[ "$path" != "$FORMULA_FILE" && "$path" != "$VERSION_FILE" && "$path" != "brew-publish-formula" ]]; then
+            die "续跑时工作区含有无关变更: $path"
+        fi
+    done < <(git status --porcelain)
+}
+
+assert_tag_available() {
+    local tag="$1"
+    if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+        die "tag 已存在: ${tag}"
+    fi
+}
+
+assert_local_tag() {
+    local tag="$1"
+    if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+        die "续跑失败：本地不存在 tag ${tag}"
+    fi
+}
+
+assert_remote_tag() {
+    local tag="$1"
+    local found
+    if ! found="$(retry_github "查询 origin 上的 tag ${tag}" git ls-remote --tags origin "refs/tags/${tag}")"; then
+        die "无法查询 origin 上的 tag ${tag}"
+    fi
+    if [[ -z "$found" ]]; then
+        die "origin 上不存在 tag ${tag}。请先推送 tag，再使用 --resume"
+    fi
+}
+
+resolve_config_path() {
+    if [[ -n "$CLI_CONFIG" ]]; then
+        [[ -f "$CLI_CONFIG" ]] || die "配置文件不存在: $CLI_CONFIG"
+        printf '%s\n' "$CLI_CONFIG"
+        return 0
+    fi
+    if [[ -f formula/brew-publish.conf ]]; then
+        printf '%s\n' "formula/brew-publish.conf"
+        return 0
+    fi
+    if [[ -f .brew-publish.conf ]]; then
+        printf '%s\n' ".brew-publish.conf"
+        return 0
+    fi
+    printf '\n'
+}
+
+# 配置文件是发布所必需的。找不到时立即停止，避免后面才报缺少 tap。
+require_config_file() {
+    CONFIG_PATH="$(resolve_config_path)"
+    if [[ -z "$CONFIG_PATH" ]]; then
+        die "当前项目没有 brew-publish.conf。可以运行下面的命令生成；若 formula/ 下没有 .rb，也会一并生成：
+  brew-publish-formula --init"
+    fi
+}
+
+resolve_formula_file() {
+    local explicit="$1"
+    local -a found
+    local path
+    found=()
+    if [[ -n "$explicit" ]]; then
+        explicit="$(normalize_repo_path "$explicit" "formula")"
+        [[ -f "$explicit" ]] || die "formula 文件不存在: $explicit"
+        printf '%s\n' "$explicit"
+        return 0
+    fi
+    if [[ -d formula ]]; then
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            found+=("$path")
+        done < <(find formula -maxdepth 1 -name '*.rb' -print | sort)
+    fi
+    if [[ ${#found[@]} -eq 1 ]]; then
+        printf '%s\n' "${found[0]}"
+        return 0
+    fi
+    if [[ ${#found[@]} -eq 0 ]]; then
+        die "未找到 formula/*.rb。请在配置中设置 formula=，或使用 --formula"
+    fi
+    die "找到多个 formula，请用 formula= 或 --formula 指定其中一个:
+$(printf '  %s\n' "${found[@]}")"
+}
+
+resolve_check_script() {
+    local value="$1"
+    if [[ "$value" == "none" ]]; then
+        printf '\n'
+        return 0
+    fi
+    if [[ -n "$value" ]]; then
+        value="$(normalize_repo_path "$value" "check")"
+        [[ -f "$value" ]] || die "检查脚本不存在: $value"
+        printf '%s\n' "$value"
+        return 0
+    fi
+    if [[ -f scripts/check.sh ]]; then
+        printf '%s\n' "scripts/check.sh"
+        return 0
+    fi
+    printf '\n'
+}
+
+# 当前项目根目录有 brew-publish-formula 时，直接对该文件做 shellcheck。
+builtin_shellcheck_target() {
+    if [[ -f brew-publish-formula ]]; then
+        printf '%s\n' "brew-publish-formula"
+    fi
+}
+
+run_builtin_shellcheck() {
+    local target="$1"
+    if ! command -v shellcheck >/dev/null 2>&1; then
+        die "缺少 shellcheck，请先安装 shellcheck。也可使用 --skip-check"
+    fi
+    shellcheck "$target"
+}
+
+latest_semver_tag() {
+    local tag version
+    local pattern
+    if [[ -n "$TAG_PREFIX" ]]; then
+        pattern="${TAG_PREFIX}*"
+    else
+        pattern='*'
+    fi
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] || continue
+        if [[ -n "$TAG_PREFIX" ]]; then
+            [[ "$tag" == "${TAG_PREFIX}"* ]] || continue
+            version="${tag#"$TAG_PREFIX"}"
+        else
+            version="$tag"
+        fi
+        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf '%s\n' "$version"
+            return 0
+        fi
+    done < <(git tag -l "$pattern" --sort=-v:refname)
+    return 1
+}
+
+# 直接写 CURRENT_VERSION / HAS_RELEASE_TAG。
+# 不能放进 $(...)：命令替换在子进程里赋值，调用方看不到标记。
+detect_current_version() {
+    local version
+    HAS_RELEASE_TAG=0
+    if version="$(latest_semver_tag)"; then
+        HAS_RELEASE_TAG=1
+        CURRENT_VERSION="$version"
+        return 0
+    fi
+    if [[ -n "$VERSION_FILE" ]]; then
+        version="$(read_version_from_file "$VERSION_FILE" "$VERSION_KEY")"
+        warn "未找到 git tag，改用 ${VERSION_FILE} 中的 ${VERSION_KEY}=${version}"
+        CURRENT_VERSION="$version"
+        return 0
+    fi
+    if version="$(read_formula_version "$FORMULA_FILE")"; then
+        warn "未找到 git tag，改用 ${FORMULA_FILE} 的 version=${version}"
+        CURRENT_VERSION="$version"
+        return 0
+    fi
+    warn "未找到 git tag 或 formula 的 version 属性，当前版本按 0.0.0 处理"
+    CURRENT_VERSION="0.0.0"
+}
+
+resolve_tap_repo() {
+    local tap_path=""
+    if ! command -v brew >/dev/null 2>&1; then
+        die "未找到 brew 命令"
+    fi
+    tap_path="$(brew --repo "$TAP_FULL" 2>/dev/null | tail -n 1 || true)"
+    if [[ -z "$tap_path" || ! -d "$tap_path" ]]; then
+        tap_path="$(brew --repo "$TAP_SHORT" 2>/dev/null | tail -n 1 || true)"
+    fi
+    if [[ -z "$tap_path" || ! -d "$tap_path" ]]; then
+        die "本地还没有 Tap「${TAP_FULL}」。请先创建后再发布：
+  brew tap-new ${TAP_FULL}
+如果这个 Tap 仓库已经在 GitHub 上，改为在本地接入：
+  brew tap ${TAP_SHORT}"
+    fi
+    if [[ ! -d "$tap_path/Formula" ]]; then
+        die "tap 中缺少 Formula/ 目录: $tap_path。请确认该 Tap 已用 brew tap-new 创建"
+    fi
+    log "已找到本地 Tap: ${tap_path}"
+    printf '%s\n' "$tap_path"
+}
+
+# 已有 formula 保持原路径。新 formula 跟随 Tap 里已经使用的目录布局。
+tap_formula_dest() {
+    local tap_path="$1"
+    local name="$2"
+    local letter flat nested existing
+    letter="${name:0:1}"
+    flat="${tap_path}/Formula/${name}.rb"
+    nested="${tap_path}/Formula/${letter}/${name}.rb"
+    if [[ -f "$flat" ]]; then
+        printf '%s\n' "$flat"
+        return 0
+    fi
+    if [[ -f "$nested" ]]; then
+        printf '%s\n' "$nested"
+        return 0
+    fi
+    existing="$(find "$tap_path/Formula" -mindepth 2 -maxdepth 2 -name '*.rb' -print 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$existing" || -d "${tap_path}/Formula/${letter}" ]]; then
+        printf '%s\n' "$nested"
+        return 0
+    fi
+    printf '%s\n' "$flat"
+}
+
+commit_if_staged() {
+    local message="$1"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        run_cmd git commit -m "$message"
+        return 0
+    fi
+    if git diff --cached --quiet; then
+        warn "没有需要提交的变更: $message"
+        return 0
+    fi
+    git commit -m "$message"
+}
+
+parse_args() {
+    BUMP_TYPE=""
+    EXPLICIT_VERSION=""
+    RESUME_MODE=0
+    DRY_RUN=0
+    SKIP_CHECK=0
+    SKIP_TAP_AUDIT=0
+    ASSUME_YES=0
+    PUSH_REMOTE=1
+    CLI_CONFIG=""
+    CLI_TAP=""
+    CLI_FORMULA=""
+    CLI_VERSION_FILE=""
+    CLI_VERSION_KEY=""
+    CLI_CHECK=""
+    CLI_HAS_CHECK=0
+    CLI_TAG_PREFIX=""
+    CLI_HAS_TAG_PREFIX=0
+    INIT_MODE=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage 0
+                ;;
+            --version)
+                [[ $# -ge 2 ]] || die "--version 需要参数"
+                EXPLICIT_VERSION="$(normalize_version "$2")"
+                shift 2
+                ;;
+            --resume)
+                [[ $# -ge 2 ]] || die "--resume 需要版本号，例如: --resume 1.0.6"
+                RESUME_MODE=1
+                EXPLICIT_VERSION="$(normalize_version "$2")"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --skip-check)
+                SKIP_CHECK=1
+                shift
+                ;;
+            --skip-tap-audit)
+                SKIP_TAP_AUDIT=1
+                shift
+                ;;
+            --yes|-y)
+                ASSUME_YES=1
+                shift
+                ;;
+            --no-push)
+                PUSH_REMOTE=0
+                shift
+                ;;
+            --config)
+                [[ $# -ge 2 ]] || die "--config 需要文件路径"
+                CLI_CONFIG="$2"
+                shift 2
+                ;;
+            --tap)
+                [[ $# -ge 2 ]] || die "--tap 需要参数，例如: --tap user/homebrew-tap"
+                CLI_TAP="$2"
+                shift 2
+                ;;
+            --formula)
+                [[ $# -ge 2 ]] || die "--formula 需要相对路径"
+                CLI_FORMULA="$2"
+                shift 2
+                ;;
+            --version-file)
+                [[ $# -ge 2 ]] || die "--version-file 需要相对路径"
+                CLI_VERSION_FILE="$2"
+                shift 2
+                ;;
+            --version-key)
+                [[ $# -ge 2 ]] || die "--version-key 需要变量名"
+                CLI_VERSION_KEY="$2"
+                shift 2
+                ;;
+            --check)
+                [[ $# -ge 2 ]] || die "--check 需要脚本路径，或 none"
+                CLI_CHECK="$2"
+                CLI_HAS_CHECK=1
+                shift 2
+                ;;
+            --tag-prefix)
+                [[ $# -ge 2 ]] || die "--tag-prefix 需要前缀，例如: v"
+                CLI_TAG_PREFIX="$2"
+                CLI_HAS_TAG_PREFIX=1
+                shift 2
+                ;;
+            --init)
+                INIT_MODE=1
+                shift
+                ;;
+            patch|minor|major)
+                if [[ -n "$BUMP_TYPE" ]]; then
+                    die "只能指定一个 bump 类型"
+                fi
+                BUMP_TYPE="$1"
+                shift
+                ;;
+            *)
+                die "未知参数: $1（使用 --help 查看用法）"
+                ;;
+        esac
+    done
+
+    if [[ "$INIT_MODE" -eq 1 ]]; then
+        if [[ -n "$BUMP_TYPE" || -n "$EXPLICIT_VERSION" || "$DRY_RUN" -eq 1 \
+            || "$SKIP_CHECK" -eq 1 || "$SKIP_TAP_AUDIT" -eq 1 || "$PUSH_REMOTE" -eq 0 \
+            || -n "$CLI_FORMULA" || -n "$CLI_VERSION_FILE" || -n "$CLI_VERSION_KEY" \
+            || "$CLI_HAS_CHECK" -eq 1 || "$CLI_HAS_TAG_PREFIX" -eq 1 ]]; then
+            die "--init 不能与发布参数一起使用。可以同时使用 --tap 或 --config"
+        fi
+        return 0
+    fi
+
+    if [[ -z "$BUMP_TYPE" && -z "$EXPLICIT_VERSION" ]]; then
+        die "请指定 patch、minor、major、--version X.Y.Z 或 --resume X.Y.Z"
+    fi
+    if [[ -n "$BUMP_TYPE" && -n "$EXPLICIT_VERSION" ]]; then
+        die "不能同时指定 bump 类型与 --version / --resume"
+    fi
+}
+
+apply_project_settings() {
+    local config_path tap_value formula_value check_value
+    config_path="$CONFIG_PATH"
+    CFG_TAP=""
+    CFG_FORMULA=""
+    CFG_VERSION_FILE=""
+    CFG_VERSION_KEY=""
+    CFG_CHECK=""
+    CFG_TAG_PREFIX=""
+    CFG_HAS_CHECK=0
+    CFG_HAS_TAG_PREFIX=0
+    if [[ -n "$config_path" ]]; then
+        log "读取配置: ${config_path}"
+        load_config_file "$config_path"
+    fi
+
+    tap_value="${CLI_TAP:-$CFG_TAP}"
+    [[ -n "$tap_value" ]] || die "未配置 tap。请在 formula/brew-publish.conf 中设置 tap=，或使用 --tap"
+    normalize_tap "$tap_value"
+
+    formula_value="${CLI_FORMULA:-$CFG_FORMULA}"
+    FORMULA_FILE="$(resolve_formula_file "$formula_value")"
+    FORMULA_NAME="$(basename "$FORMULA_FILE" .rb)"
+    if [[ ! "$FORMULA_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9+@._-]*$ ]]; then
+        die "无法从文件名得到 formula 名称: $FORMULA_FILE"
+    fi
+
+    VERSION_FILE="${CLI_VERSION_FILE:-$CFG_VERSION_FILE}"
+    VERSION_KEY="${CLI_VERSION_KEY:-$CFG_VERSION_KEY}"
+    if [[ -n "$VERSION_FILE" ]]; then
+        VERSION_FILE="$(normalize_repo_path "$VERSION_FILE" "version_file")"
+        [[ -f "$VERSION_FILE" ]] || die "版本文件不存在: $VERSION_FILE"
+    fi
+    if [[ -n "$VERSION_FILE" && -z "$VERSION_KEY" ]]; then
+        die "已设置版本文件，但缺少 version_key"
+    fi
+    if [[ -z "$VERSION_FILE" && -n "$VERSION_KEY" ]]; then
+        die "已设置 version_key，但缺少 version_file"
+    fi
+
+    if [[ "$CLI_HAS_TAG_PREFIX" -eq 1 ]]; then
+        TAG_PREFIX="$CLI_TAG_PREFIX"
+    elif [[ "$CFG_HAS_TAG_PREFIX" -eq 1 ]]; then
+        TAG_PREFIX="$CFG_TAG_PREFIX"
+    else
+        TAG_PREFIX="v"
+    fi
+    case "$TAG_PREFIX" in
+        *[[:space:]/]*) die "tag_prefix 不能包含空白或斜杠: $TAG_PREFIX" ;;
+    esac
+
+    if [[ "$CLI_HAS_CHECK" -eq 1 ]]; then
+        check_value="$CLI_CHECK"
+    elif [[ "$CFG_HAS_CHECK" -eq 1 ]]; then
+        check_value="$CFG_CHECK"
+    else
+        check_value=""
+    fi
+    CHECK_SCRIPT="$(resolve_check_script "$check_value")"
+}
+
+load_github_origin() {
+    local remote_url parsed owner repo
+    if ! remote_url="$(git remote get-url origin 2>/dev/null)"; then
+        die "未配置 origin。请把 origin 指向要发布的 GitHub 仓库"
+    fi
+    if ! parsed="$(parse_github_remote "$remote_url")"; then
+        die "origin 不是 GitHub 仓库: $remote_url"
+    fi
+    owner="$(printf '%s\n' "$parsed" | sed -n '1p')"
+    repo="$(printf '%s\n' "$parsed" | sed -n '2p')"
+    if [[ ! "$owner" =~ ^[A-Za-z0-9_.-]+$ || ! "$repo" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        die "无法解析 GitHub 仓库: $remote_url"
+    fi
+    GITHUB_OWNER="$owner"
+    GITHUB_REPO="$repo"
+}
+
+print_plan() {
+    local mode_label bump_label check_label version_source
+    if [[ "$RESUME_MODE" -eq 1 ]]; then
+        mode_label="resume"
+    else
+        mode_label="full"
+    fi
+    bump_label="${BUMP_TYPE:-explicit}"
+    if [[ -n "$VERSION_FILE" ]]; then
+        version_source="${VERSION_FILE} (${VERSION_KEY})"
+    else
+        version_source="formula version"
+    fi
+    if [[ "$SKIP_CHECK" -eq 1 ]]; then
+        check_label="skip"
+    elif [[ -n "$CHECK_SCRIPT" ]]; then
+        check_label="$CHECK_SCRIPT"
+    elif [[ -n "$(builtin_shellcheck_target)" ]]; then
+        check_label="shellcheck $(builtin_shellcheck_target)"
+    else
+        check_label="none"
+    fi
+    cat <<EOF
+
+========================================
+  ${FORMULA_NAME} 发布计划
+========================================
+  当前版本 : ${CURRENT_VERSION}
+  新版本   : ${NEW_VERSION}  (tag: ${NEW_TAG})
+  bump     : ${bump_label}
+  模式     : ${mode_label}
+  源码包   : ${ARCHIVE_URL}
+  项目目录 : ${PROJECT_ROOT}
+  GitHub   : ${GITHUB_OWNER}/${GITHUB_REPO}
+  Formula  : ${FORMULA_FILE}
+  版本来源 : ${version_source}
+  检查脚本 : ${check_label}
+  Tap 仓库 : ${TAP_PATH}
+  Tap 文件 : ${TAP_FORMULA_PATH}
+  dry-run  : ${DRY_RUN}
+  推送远程 : ${PUSH_REMOTE}
+========================================
+
+EOF
+}
+
+sync_formula_contents() {
+    local version="$1"
+    local hash="$2"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '[dry-run] 更新 %s 的 url、sha256 和 version → %s\n' "$FORMULA_FILE" "$hash"
+        if [[ -n "$VERSION_FILE" ]]; then
+            printf '[dry-run] 更新 %s 的 %s → %s\n' "$VERSION_FILE" "$VERSION_KEY" "$version"
+        fi
+        return 0
+    fi
+    update_formula_file "$FORMULA_FILE" "$ARCHIVE_URL" "$hash" "$version"
+    if [[ -n "$VERSION_FILE" ]]; then
+        update_version_file "$VERSION_FILE" "$VERSION_KEY" "$version"
+    fi
+}
+
+# Homebrew 类名：brew-publish-formula → BrewPublishFormula。
+formula_class_name() {
+    local name="$1"
+    local result="" cap_next=1 i c next
+    local len=${#name}
+    for ((i = 0; i < len; i++)); do
+        c="${name:i:1}"
+        next="${name:i+1:1}"
+        if [[ "$c" == "+" ]]; then
+            result+="x"
+            continue
+        fi
+        if [[ "$c" == "@" && "$next" =~ [0-9] ]]; then
+            result+="AT${next}"
+            i=$((i + 1))
+            continue
+        fi
+        if [[ "$c" == "-" || "$c" == "_" || "$c" == "." || "$c" == " " ]]; then
+            cap_next=1
+            continue
+        fi
+        if [[ "$cap_next" -eq 1 ]]; then
+            result+="$(printf '%s' "$c" | tr '[:lower:]' '[:upper:]')"
+            cap_next=0
+        else
+            result+="$c"
+        fi
+    done
+    printf '%s\n' "$result"
+}
+
+list_formula_rb() {
+    local path
+    FORMULA_RB_FILES=()
+    if [[ ! -d formula ]]; then
+        return 0
+    fi
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        FORMULA_RB_FILES+=("$path")
+    done < <(find formula -maxdepth 1 -name '*.rb' -print | sort)
+}
+
+# 已有配置返回其路径。没有配置时返回将要创建的 formula/brew-publish.conf。
+init_config_path() {
+    if [[ -n "$CLI_CONFIG" ]]; then
+        normalize_repo_path "$CLI_CONFIG" "config"
+        return 0
+    fi
+    if [[ -f formula/brew-publish.conf ]]; then
+        printf '%s\n' "formula/brew-publish.conf"
+        return 0
+    fi
+    if [[ -f .brew-publish.conf ]]; then
+        printf '%s\n' ".brew-publish.conf"
+        return 0
+    fi
+    printf '%s\n' "formula/brew-publish.conf"
+}
+
+write_formula_template() {
+    local path="$1"
+    local formula_name="$2"
+    local class_name="$3"
+    local version="$4"
+    mkdir -p "$(dirname "$path")"
+    cat > "$path" <<EOF
+# 由 brew-publish-formula --init 生成。
+# 请按项目修改 desc、license 和 install。
+class ${class_name} < Formula
+  desc "Install ${formula_name}"
+  homepage "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}"
+  version "${version}"
+  url "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/archive/refs/tags/${TAG_PREFIX}#{version}.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  license "MIT"
+
+  def install
+    bin.install "${formula_name}"
+  end
+
+  test do
+    assert_match "${formula_name}", shell_output("#{bin}/${formula_name} --help")
+  end
+end
+EOF
+}
+
+write_publish_config() {
+    local path="$1"
+    local tap="$2"
+    local formula_rel="$3"
+    mkdir -p "$(dirname "$path")"
+    cat > "$path" <<EOF
+# 由 brew-publish-formula --init 生成。发布前请按项目修改。
+tap=${tap}
+formula=${formula_rel}
+tag_prefix=v
+EOF
+}
+
+# 生成缺失的配置和 formula。已有文件不会覆盖。
+run_init() {
+    local conf_path formula_rel formula_name class_name version tap
+    local created_conf=0 created_rb=0
+    load_github_origin
+    list_formula_rb
+
+    formula_name="$(printf '%s' "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$formula_name" =~ ^[a-z][a-z0-9+@._-]*$ ]]; then
+        die "仓库名不能用作 formula 文件名: ${GITHUB_REPO}"
+    fi
+    class_name="$(formula_class_name "$formula_name")"
+    if [[ ! "$class_name" =~ ^[A-Z][A-Za-z0-9]*$ ]]; then
+        die "无法从仓库名得到 formula 类名: ${formula_name}"
+    fi
+
+    TAG_PREFIX="v"
+    if version="$(latest_semver_tag)"; then
+        :
+    else
+        version="0.1.0"
+    fi
+
+    if [[ -n "$CLI_TAP" ]]; then
+        tap="$CLI_TAP"
+    else
+        tap="${GITHUB_OWNER}/homebrew-tap"
+    fi
+    normalize_tap "$tap"
+
+    conf_path="$(init_config_path)"
+    if [[ ${#FORMULA_RB_FILES[@]} -eq 1 ]]; then
+        formula_rel="${FORMULA_RB_FILES[0]}"
+    elif [[ ${#FORMULA_RB_FILES[@]} -eq 0 ]]; then
+        formula_rel="formula/${formula_name}.rb"
+    else
+        formula_rel=""
+    fi
+
+    if [[ ! -f "$conf_path" ]]; then
+        if [[ -z "$formula_rel" ]]; then
+            die "formula/ 下有多个 .rb，无法决定配置里的 formula=。请只保留一个，或先写好配置并指定 formula=：
+$(printf '  %s\n' "${FORMULA_RB_FILES[@]}")"
+        fi
+        write_publish_config "$conf_path" "$tap" "$formula_rel"
+        created_conf=1
+        log "已创建配置: ${conf_path}"
+    else
+        log "配置已存在，保持不变: ${conf_path}"
+    fi
+
+    if [[ ${#FORMULA_RB_FILES[@]} -eq 0 ]]; then
+        write_formula_template "$formula_rel" "$formula_name" "$class_name" "$version"
+        created_rb=1
+        log "已创建 formula: ${formula_rel}"
+        log "请按项目修改其中的 desc、license 和 install"
+        if [[ "$created_conf" -eq 0 ]] && ! grep -q '^[[:space:]]*formula=' "$conf_path"; then
+            warn "请在 ${conf_path} 中设置 formula=${formula_rel}"
+        fi
+    else
+        log "formula/ 下已有 .rb，未新建 formula"
+    fi
+
+    if [[ "$created_conf" -eq 0 && "$created_rb" -eq 0 ]]; then
+        log "没有需要创建的文件"
+    fi
+}
+
+main() {
+    set -euo pipefail
+    unset CDPATH
+
+    parse_args "$@"
+    require_git_root
+    if [[ "$INIT_MODE" -eq 1 ]]; then
+        run_init
+        return 0
+    fi
+    require_config_file
+    require_tools
+    apply_project_settings
+    TAP_PATH="$(resolve_tap_repo)"
+    load_github_origin
+
+    detect_current_version
+    if [[ -n "$EXPLICIT_VERSION" ]]; then
+        NEW_VERSION="$EXPLICIT_VERSION"
+    else
+        NEW_VERSION="$(bump_version "$CURRENT_VERSION" "$BUMP_TYPE")"
+    fi
+    NEW_TAG="${TAG_PREFIX}${NEW_VERSION}"
+    ARCHIVE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/archive/refs/tags/${NEW_TAG}.tar.gz"
+
+    if [[ "$RESUME_MODE" -eq 0 && "$HAS_RELEASE_TAG" -eq 1 ]]; then
+        if [[ "$CURRENT_VERSION" == "$NEW_VERSION" ]]; then
+            die "新版本与当前最新 tag 相同: ${NEW_VERSION}"
+        fi
+        if version_lt "$NEW_VERSION" "$CURRENT_VERSION"; then
+            die "新版本 ${NEW_VERSION} 不能低于当前版本 ${CURRENT_VERSION}"
+        fi
+    fi
+
+    TAP_FORMULA_PATH="$(tap_formula_dest "$TAP_PATH" "$FORMULA_NAME")"
+    print_plan
+    confirm "确认按上述计划发布？" || die "已取消"
+
+    if [[ "$RESUME_MODE" -eq 0 ]]; then
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            assert_clean_worktree
+            assert_tag_available "$NEW_TAG"
+        elif [[ -n "$(git status --porcelain)" ]]; then
+            warn "工作区不干净。正式发布前需要先提交或清理"
+        fi
+
+        if [[ "$SKIP_CHECK" -eq 1 ]]; then
+            warn "已跳过检查脚本"
+        elif [[ -n "$CHECK_SCRIPT" ]]; then
+            log "运行 ${CHECK_SCRIPT}"
+            run_cmd bash "$CHECK_SCRIPT"
+        elif [[ -n "$(builtin_shellcheck_target)" ]]; then
+            log "运行 shellcheck $(builtin_shellcheck_target)"
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                printf '[dry-run] shellcheck %s\n' "$(builtin_shellcheck_target)"
+            else
+                run_builtin_shellcheck "$(builtin_shellcheck_target)"
+            fi
+        else
+            log "没有检查脚本，跳过"
+        fi
+
+        if [[ -n "$VERSION_FILE" ]]; then
+            log "更新 ${VERSION_FILE} 中的 ${VERSION_KEY} → ${NEW_VERSION}"
+        else
+            log "更新 ${FORMULA_FILE} 的 version → ${NEW_VERSION}"
+        fi
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION"
+            git add -- "$FORMULA_FILE"
+            if [[ -n "$VERSION_FILE" ]]; then
+                update_version_file "$VERSION_FILE" "$VERSION_KEY" "$NEW_VERSION"
+                git add -- "$VERSION_FILE"
+            elif [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
+                update_version_file brew-publish-formula TOOL_VERSION "$NEW_VERSION"
+                git add -- brew-publish-formula
+            fi
+            commit_if_staged "chore: bump version to ${NEW_VERSION}"
+        else
+            printf '[dry-run] 更新 %s 的 version → %s\n' "$FORMULA_FILE" "$NEW_VERSION"
+            run_cmd git add -- "$FORMULA_FILE"
+            if [[ -n "$VERSION_FILE" ]]; then
+                printf '[dry-run] 更新 %s 的 %s → %s\n' "$VERSION_FILE" "$VERSION_KEY" "$NEW_VERSION"
+                run_cmd git add -- "$VERSION_FILE"
+            fi
+            run_cmd git commit -m "chore: bump version to ${NEW_VERSION}"
+        fi
+
+        log "创建 tag ${NEW_TAG}"
+        run_cmd git tag -a "$NEW_TAG" -m "Release ${NEW_TAG}"
+
+        if [[ "$PUSH_REMOTE" -eq 1 ]]; then
+            log "推送项目仓库到 origin（含 tag）"
+            git_push_origin_head
+            git_push_origin_tag "$NEW_TAG"
+        else
+            warn "已跳过 git push（--no-push）。后续无法从 GitHub 下载源码包。"
+            if [[ "$DRY_RUN" -eq 0 ]]; then
+                die "使用 --no-push 时无法完成 sha256 计算与 Tap 发布。本地已创建 tag ${NEW_TAG}。"
+            fi
+        fi
+    else
+        log "续跑模式：从计算 sha256 继续"
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            assert_resume_worktree
+            assert_local_tag "$NEW_TAG"
+            assert_remote_tag "$NEW_TAG"
+        fi
+    fi
+
+    log "计算 ${NEW_TAG} 源码包 sha256"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        NEW_SHA256="<dry-run-sha256>"
+        printf '[dry-run] curl + shasum → %s\n' "$NEW_SHA256"
+    else
+        NEW_SHA256="$(compute_archive_sha256 "$NEW_TAG" "$ARCHIVE_URL")"
+        log "sha256 = ${NEW_SHA256}"
+    fi
+
+    log "同步 ${FORMULA_FILE}"
+    sync_formula_contents "$NEW_VERSION" "$NEW_SHA256"
+    log "检查 formula Ruby 语法"
+    run_cmd ruby -c "$FORMULA_FILE"
+
+    log "提交项目仓库中的 formula 更新"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        git add -- "$FORMULA_FILE"
+        if [[ -n "$VERSION_FILE" ]]; then
+            git add -- "$VERSION_FILE"
+        fi
+        commit_if_staged "chore: update formula for ${NEW_TAG}"
+        if [[ "$PUSH_REMOTE" -eq 1 ]]; then
+            git_push_origin_head
+        fi
+    else
+        run_cmd git add -- "$FORMULA_FILE"
+        if [[ -n "$VERSION_FILE" ]]; then
+            run_cmd git add -- "$VERSION_FILE"
+        fi
+        run_cmd git commit -m "chore: update formula for ${NEW_TAG}"
+        if [[ "$PUSH_REMOTE" -eq 1 ]]; then
+            run_cmd git push origin HEAD
+        fi
+    fi
+
+    log "同步 formula 到 Tap: ${TAP_FORMULA_PATH}"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$(dirname "$TAP_FORMULA_PATH")"
+        cp "$FORMULA_FILE" "$TAP_FORMULA_PATH"
+    else
+        run_cmd mkdir -p "$(dirname "$TAP_FORMULA_PATH")"
+        run_cmd cp "$FORMULA_FILE" "$TAP_FORMULA_PATH"
+    fi
+
+    if [[ "$SKIP_TAP_AUDIT" -eq 0 ]]; then
+        log "运行 brew style --fix / brew audit（提交 Tap 之前）"
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            brew style --fix "$TAP_FORMULA_PATH" || warn "brew style 未完全通过，请人工检查"
+            brew audit "$TAP_FORMULA_PATH" || warn "brew audit 未完全通过，请人工检查"
+        else
+            run_cmd brew style --fix "$TAP_FORMULA_PATH"
+            run_cmd brew audit "$TAP_FORMULA_PATH"
+        fi
+    else
+        warn "已跳过 brew style / brew audit"
+    fi
+
+    if [[ "$DRY_RUN" -eq 0 && "$SKIP_TAP_AUDIT" -eq 0 ]]; then
+        if ! cmp -s "$FORMULA_FILE" "$TAP_FORMULA_PATH"; then
+            log "brew style 修改了 formula，回同步到项目仓库"
+            cp "$TAP_FORMULA_PATH" "$FORMULA_FILE"
+            git add -- "$FORMULA_FILE"
+            commit_if_staged "chore: apply brew style fixes for ${NEW_TAG}"
+            if [[ "$PUSH_REMOTE" -eq 1 ]]; then
+                git_push_origin_head
+            fi
+        fi
+    fi
+
+    log "提交并推送 Tap 仓库"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        (
+            cd "$TAP_PATH"
+            git add -- "${TAP_FORMULA_PATH#"$TAP_PATH"/}"
+            if git diff --cached --quiet; then
+                warn "Tap 中 formula 无变化，跳过提交"
+            else
+                git commit -m "${FORMULA_NAME} ${NEW_TAG}"
+                if [[ "$PUSH_REMOTE" -eq 1 ]]; then
+                    if ! retry_github "推送 Tap 到 origin" git push; then
+                        die "推送 Tap 失败。若当前分支没有上游，请在 Tap 仓库执行: git push -u origin HEAD"
+                    fi
+                fi
+            fi
+        )
+    else
+        run_cmd git -C "$TAP_PATH" add -- "${TAP_FORMULA_PATH#"$TAP_PATH"/}"
+        run_cmd git -C "$TAP_PATH" commit -m "${FORMULA_NAME} ${NEW_TAG}"
+        if [[ "$PUSH_REMOTE" -eq 1 ]]; then
+            run_cmd git -C "$TAP_PATH" push
+        fi
+    fi
+
+    local title
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        title="预览完成，没有修改文件，也没有推送。"
+    else
+        title="发布完成。"
+    fi
+
+    cat <<EOF
+
+${title}
+
+  版本     : ${NEW_TAG}
+  源码包   : ${ARCHIVE_URL}
+  sha256   : ${NEW_SHA256}
+  项目仓库 : ${PROJECT_ROOT}
+  Tap      : ${TAP_FORMULA_PATH}
+
+用户安装:
+  brew tap ${TAP_SHORT}
+  brew install ${FORMULA_NAME}
+  # 或: brew install ${TAP_SHORT}/${FORMULA_NAME}
+
+已安装用户升级:
+  brew update && brew upgrade ${FORMULA_NAME}
+
+EOF
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
