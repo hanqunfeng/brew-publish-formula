@@ -1,5 +1,7 @@
+# 由 brew-publish-formula --init 生成。
+# 请按项目修改 desc、license 和 install。
 class BrewPublishFormula < Formula
-  desc "Publish project releases to a Homebrew tap"
+  desc "Install brew-publish-formula"
   homepage "https://github.com/hanqunfeng/brew-publish-formula"
   version "0.1.0"
   url "https://github.com/hanqunfeng/brew-publish-formula/archive/refs/tags/v#{version}.tar.gz"
@@ -10,15 +12,7 @@ class BrewPublishFormula < Formula
     bin.install "brew-publish-formula"
   end
 
-  def caveats
-    <<~EOS
-      Run brew-publish-formula in the root of the project you want to publish.
-      That project needs formula/brew-publish.conf, or .brew-publish.conf.
-      Publishing also needs git, curl, ruby, and a local Homebrew tap.
-    EOS
-  end
-
   test do
-    assert_match "Homebrew Tap", shell_output("#{bin}/brew-publish-formula --help")
+    assert_match "brew-publish-formula", shell_output("#{bin}/brew-publish-formula --help")
   end
 end
