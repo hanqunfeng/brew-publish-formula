@@ -10,12 +10,12 @@
 #
 # 完整流程：
 #   1. 确认当前目录是 git 仓库根目录（--help 除外）
-#   2. 确认项目中存在 formula/brew-publish.conf（或 .brew-publish.conf / --config）
+#   2. 确认项目中存在 .formula/brew-publish.conf（或 .brew-publish.conf / --config）
 #   3. 确认配置中的 Homebrew Tap 已在本地存在，否则提示先创建
-#   4. 从 origin 解析 GitHub 仓库，定位 formula/*.rb
+#   4. 从 origin 解析 GitHub 仓库，定位 .formula/*.rb
 #   5. 根据最新 git tag + bump 类型计算新版本，或使用 --version
-#   6. 运行项目检查脚本（默认 scripts/check.sh；本仓库直接 shellcheck 主文件，可用 --skip-check 跳过）
-#   7. 更新 formula 的 url（若配置了 version_file，同时更新该文件），提交并推送，创建 annotated tag（如 v1.0.6）
+#   6. 发布本仓库时对主文件运行 shellcheck（可用 --skip-check 跳过）
+#   7. 更新 formula 的 url，提交并推送，创建 annotated tag（如 v1.0.6）
 #   8. 下载该 tag 的 GitHub 源码包并计算 sha256
 #   9. 更新 formula 的 url / sha256，提交并推送项目仓库
 #  10. 将 formula 复制到本地 Tap，执行 brew style / brew audit
@@ -36,35 +36,31 @@
 #   brew-publish-formula patch --skip-check --yes
 #   brew-publish-formula --init
 #
-# 项目配置（formula/brew-publish.conf）示例:
+# 项目配置（.formula/brew-publish.conf）示例:
 #   tap=hanqunfeng/homebrew-tap
-#   formula=formula/java-project-generator.rb
-#   version_file=springboot          # 可选；省略时从 formula 的 url 读取版本
-#   version_key=SCRIPT_VERSION       # 与 version_file 成对出现
-#   check=scripts/check.sh
+#   formula=java-project-generator.rb
 #   tag_prefix=v
 #
 # 选项:
 #   --config FILE       指定配置文件
 #   --tap USER/REPO     覆盖配置中的 tap（user/tap 或 user/homebrew-tap）
-#   --formula PATH      覆盖 formula 相对路径
-#   --version-file PATH 覆盖版本文件相对路径
-#   --version-key KEY   覆盖版本赋值的变量名，匹配整行 KEY="X.Y.Z"
-#   --check PATH        覆盖检查脚本；none 表示不检查
+#   --formula NAME      覆盖 formula 文件名，例如 brew-publish-formula.rb
 #   --tag-prefix PFX    覆盖 tag 前缀，默认 v
 #   --dry-run           只打印计划，不修改文件、不推送
 #   --yes, -y           跳过交互确认
-#   --skip-check        跳过检查脚本
+#   --skip-check        发布本仓库时跳过 shellcheck
 #   --skip-tap-audit    跳过 brew style / brew audit
 #   --no-push           不推送远程（无法完成 sha256 与 Tap 发布）
 #   --resume X.Y.Z      tag 已推送时从计算 sha256 继续
-#   --init              缺少配置时生成 formula/brew-publish.conf；
-#                       formula/ 下没有 .rb 时一并生成 formula 模板。独立命令，不发布
+#   --init              缺少配置时生成 .formula/brew-publish.conf。
+#                       .formula/ 下没有目标 .rb 时，先看本地 Tap：
+#                       Tap 不存在则询问是否创建；Tap 里已有同名 .rb 则复制过来；
+#                       没有则询问是否生成模板。独立命令，不发布
 #   -h, --help          显示本说明
 #
 # 前置条件:
 #   - 当前目录是 git 仓库根目录
-#   - 全量发布时工作区干净；--resume 时只允许 formula 和版本文件已修改
+#   - 全量发布时工作区干净；--resume 时只允许 .formula 中的公式和 brew-publish-formula 已修改
 #   - origin 指向 GitHub 仓库，并且有 push 权限
 #   - 本地已经存在要发布到的 Tap。没有时请先执行 brew tap-new user/homebrew-repo
 #   - formula 里只有一对顶层 url 与 sha256
@@ -73,7 +69,7 @@
 # 说明:
 #   tag 对应的源码包哈希要等 tag 推上 GitHub 才能计算，因此 formula 的
 #   sha256 提交落在 tag 之后。Homebrew 安装使用 Tap 仓库里的 formula。
-#   项目仓库中的 formula/ 是同步源。
+#   项目仓库中的 .formula/ 是同步源。
 #   连接 GitHub 的 git push、git ls-remote 和源码包下载都会重试，最多 8 次，
 #   间隔从 3 秒起，每次失败增加 2 秒。权限不足、推送被拒绝这类错误不会重试。
 # =============================================================================
@@ -214,11 +210,7 @@ load_config_file() {
     local line key value
     CFG_TAP=""
     CFG_FORMULA=""
-    CFG_VERSION_FILE=""
-    CFG_VERSION_KEY=""
-    CFG_CHECK=""
     CFG_TAG_PREFIX=""
-    CFG_HAS_CHECK=0
     CFG_HAS_TAG_PREFIX=0
     [[ -f "$file" ]] || die "配置文件不存在: $file"
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -237,12 +229,6 @@ load_config_file() {
         case "$key" in
             tap) CFG_TAP="$value" ;;
             formula) CFG_FORMULA="$value" ;;
-            version_file) CFG_VERSION_FILE="$value" ;;
-            version_key) CFG_VERSION_KEY="$value" ;;
-            check)
-                CFG_CHECK="$value"
-                CFG_HAS_CHECK=1
-                ;;
             tag_prefix)
                 CFG_TAG_PREFIX="$value"
                 CFG_HAS_TAG_PREFIX=1
@@ -280,7 +266,7 @@ update_version_file() {
     local tmp awk_status
     [[ -f "$file" ]] || die "版本文件不存在: $file"
     if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        die "version_key 只能包含字母、数字和下划线: $key"
+        die "变量名只能包含字母、数字和下划线: $key"
     fi
     tmp="$(mktemp)"
     awk -v key="$key" -v ver="$version" '
@@ -306,27 +292,6 @@ update_version_file() {
         die "更新版本文件失败: $file"
     fi
     replace_file_preserving_mode "$file" "$tmp"
-}
-
-read_version_from_file() {
-    local file="$1"
-    local key="$2"
-    local value
-    [[ -f "$file" ]] || die "版本文件不存在: $file"
-    value="$(
-        awk -v key="$key" '
-            $0 ~ "^[[:space:]]*" key "=\"" {
-                if (match($0, /"[0-9]+\.[0-9]+\.[0-9]+"/)) {
-                    print substr($0, RSTART + 1, RLENGTH - 2)
-                    exit
-                }
-            }
-        ' "$file"
-    )"
-    if [[ -z "$value" ]]; then
-        die "无法从 ${file} 的 ${key} 读取版本号"
-    fi
-    printf '%s\n' "$value"
 }
 
 count_formula_lines() {
@@ -570,9 +535,9 @@ confirm() {
         return 0
     fi
     if [[ ! -t 0 ]]; then
-        die "当前不是交互终端，请追加 --yes 确认发布"
+        die "当前不是交互终端，请追加 --yes"
     fi
-    printf '%s [y/N] ' "$prompt"
+    printf '%s [y/N] ' "$prompt" >&2
     if ! read -r reply; then
         die "无法读取确认输入，请使用 --yes"
     fi
@@ -709,7 +674,7 @@ $(git status --short)"
     fi
 }
 
-# 续跑只允许 formula 与版本文件有改动，避免把无关文件提交进发布。
+# 续跑只允许 formula 和本命令脚本有改动，避免把无关文件提交进发布。
 assert_resume_worktree() {
     local line path
     while IFS= read -r line; do
@@ -718,7 +683,7 @@ assert_resume_worktree() {
         case "$path" in
             *" -> "*) die "续跑时不支持重命名变更: $path" ;;
         esac
-        if [[ "$path" != "$FORMULA_FILE" && "$path" != "$VERSION_FILE" && "$path" != "brew-publish-formula" ]]; then
+        if [[ "$path" != "$FORMULA_FILE" && "$path" != "brew-publish-formula" ]]; then
             die "续跑时工作区含有无关变更: $path"
         fi
     done < <(git status --porcelain)
@@ -755,8 +720,8 @@ resolve_config_path() {
         printf '%s\n' "$CLI_CONFIG"
         return 0
     fi
-    if [[ -f formula/brew-publish.conf ]]; then
-        printf '%s\n' "formula/brew-publish.conf"
+    if [[ -f .formula/brew-publish.conf ]]; then
+        printf '%s\n' ".formula/brew-publish.conf"
         return 0
     fi
     if [[ -f .brew-publish.conf ]]; then
@@ -770,56 +735,51 @@ resolve_config_path() {
 require_config_file() {
     CONFIG_PATH="$(resolve_config_path)"
     if [[ -z "$CONFIG_PATH" ]]; then
-        die "当前项目没有 brew-publish.conf。可以运行下面的命令生成；若 formula/ 下没有 .rb，也会一并生成：
+        die "当前项目没有 brew-publish.conf。可以运行下面的命令生成：
   brew-publish-formula --init"
     fi
+}
+
+# formula= 只写文件名。实际文件在 .formula/ 下。
+formula_basename() {
+    local name="$1"
+    name="$(trim "$name")"
+    name="${name#./}"
+    if [[ -z "$name" || "$name" == */* ]]; then
+        die "formula= 只写文件名，不要带目录: ${name:-<空>}"
+    fi
+    if [[ "$name" != *.rb ]]; then
+        die "formula= 应以 .rb 结尾: $name"
+    fi
+    printf '%s\n' "$name"
 }
 
 resolve_formula_file() {
     local explicit="$1"
     local -a found
-    local path
+    local path name
     found=()
     if [[ -n "$explicit" ]]; then
-        explicit="$(normalize_repo_path "$explicit" "formula")"
-        [[ -f "$explicit" ]] || die "formula 文件不存在: $explicit"
-        printf '%s\n' "$explicit"
+        name="$(formula_basename "$explicit")"
+        [[ -f ".formula/${name}" ]] || die "formula 文件不存在: .formula/${name}"
+        printf '%s\n' ".formula/${name}"
         return 0
     fi
-    if [[ -d formula ]]; then
+    if [[ -d .formula ]]; then
         while IFS= read -r path; do
             [[ -n "$path" ]] || continue
             found+=("$path")
-        done < <(find formula -maxdepth 1 -name '*.rb' -print | sort)
+        done < <(find .formula -maxdepth 1 -name '*.rb' -print | sort)
     fi
     if [[ ${#found[@]} -eq 1 ]]; then
         printf '%s\n' "${found[0]}"
         return 0
     fi
     if [[ ${#found[@]} -eq 0 ]]; then
-        die "未找到 formula/*.rb。请在配置中设置 formula=，或使用 --formula"
+        die "未找到 .formula/*.rb。请在配置中设置 formula=文件名.rb，或使用 --formula"
     fi
-    die "找到多个 formula，请用 formula= 或 --formula 指定其中一个:
+    die "找到多个 formula，请用 formula= 或 --formula 指定其中一个文件名:
 $(printf '  %s\n' "${found[@]}")"
-}
-
-resolve_check_script() {
-    local value="$1"
-    if [[ "$value" == "none" ]]; then
-        printf '\n'
-        return 0
-    fi
-    if [[ -n "$value" ]]; then
-        value="$(normalize_repo_path "$value" "check")"
-        [[ -f "$value" ]] || die "检查脚本不存在: $value"
-        printf '%s\n' "$value"
-        return 0
-    fi
-    if [[ -f scripts/check.sh ]]; then
-        printf '%s\n' "scripts/check.sh"
-        return 0
-    fi
-    printf '\n'
 }
 
 # 当前项目根目录有 brew-publish-formula 时，直接对该文件做 shellcheck。
@@ -871,12 +831,6 @@ detect_current_version() {
         CURRENT_VERSION="$version"
         return 0
     fi
-    if [[ -n "$VERSION_FILE" ]]; then
-        version="$(read_version_from_file "$VERSION_FILE" "$VERSION_KEY")"
-        warn "未找到 git tag，改用 ${VERSION_FILE} 中的 ${VERSION_KEY}=${version}"
-        CURRENT_VERSION="$version"
-        return 0
-    fi
     if version="$(read_formula_version "$FORMULA_FILE")"; then
         warn "未找到 git tag，改用 ${FORMULA_FILE} 中的版本 ${version}"
         CURRENT_VERSION="$version"
@@ -888,14 +842,7 @@ detect_current_version() {
 
 resolve_tap_repo() {
     local tap_path=""
-    if ! command -v brew >/dev/null 2>&1; then
-        die "未找到 brew 命令"
-    fi
-    tap_path="$(brew --repo "$TAP_FULL" 2>/dev/null | tail -n 1 || true)"
-    if [[ -z "$tap_path" || ! -d "$tap_path" ]]; then
-        tap_path="$(brew --repo "$TAP_SHORT" 2>/dev/null | tail -n 1 || true)"
-    fi
-    if [[ -z "$tap_path" || ! -d "$tap_path" ]]; then
+    if ! tap_path="$(find_local_tap)"; then
         die "本地还没有 Tap「${TAP_FULL}」。请先创建后再发布：
   brew tap-new ${TAP_FULL}
 如果这个 Tap 仓库已经在 GitHub 上，改为在本地接入：
@@ -906,6 +853,73 @@ resolve_tap_repo() {
     fi
     log "已找到本地 Tap: ${tap_path}"
     printf '%s\n' "$tap_path"
+}
+
+# 打印本地 Tap 目录。不存在时返回 1，不打印内容。
+find_local_tap() {
+    local tap_path=""
+    if ! command -v brew >/dev/null 2>&1; then
+        die "未找到 brew 命令"
+    fi
+    tap_path="$(brew --repo "$TAP_FULL" 2>/dev/null | tail -n 1 || true)"
+    if [[ -z "$tap_path" || ! -d "$tap_path" ]]; then
+        tap_path="$(brew --repo "$TAP_SHORT" 2>/dev/null | tail -n 1 || true)"
+    fi
+    if [[ -n "$tap_path" && -d "$tap_path" ]]; then
+        printf '%s\n' "$tap_path"
+        return 0
+    fi
+    return 1
+}
+
+# --init 使用。Tap 不存在时询问是否 brew tap-new。
+ensure_local_tap() {
+    local tap_path=""
+    if tap_path="$(find_local_tap)"; then
+        log "已找到本地 Tap: ${tap_path}"
+        printf '%s\n' "$tap_path"
+        return 0
+    fi
+    if ! confirm "本地还没有 Tap「${TAP_FULL}」，是否现在创建？"; then
+        log "未创建 Tap「${TAP_FULL}」"
+        return 1
+    fi
+    log "创建 Tap: brew tap-new ${TAP_FULL}"
+    brew tap-new "$TAP_FULL" >&2
+    if ! tap_path="$(find_local_tap)"; then
+        die "brew tap-new 之后仍找不到 Tap: ${TAP_FULL}"
+    fi
+    if [[ ! -d "$tap_path/Formula" ]]; then
+        die "tap 中缺少 Formula/ 目录: $tap_path"
+    fi
+    log "已创建本地 Tap: ${tap_path}"
+    printf '%s\n' "$tap_path"
+}
+
+# 在 Tap 中查找已有的 formula 文件。找不到时返回 1。
+find_tap_formula_file() {
+    local tap_path="$1"
+    local name="$2"
+    local letter flat nested found
+    letter="$(printf '%s' "${name:0:1}" | tr '[:upper:]' '[:lower:]')"
+    flat="${tap_path}/Formula/${name}.rb"
+    nested="${tap_path}/Formula/${letter}/${name}.rb"
+    if [[ -f "$flat" ]]; then
+        printf '%s\n' "$flat"
+        return 0
+    fi
+    if [[ -f "$nested" ]]; then
+        printf '%s\n' "$nested"
+        return 0
+    fi
+    if [[ -d "$tap_path/Formula" ]]; then
+        found="$(find "$tap_path/Formula" -name "${name}.rb" -print 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$found" && -f "$found" ]]; then
+            printf '%s\n' "$found"
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # 已有 formula 保持原路径。新 formula 跟随 Tap 里已经使用的目录布局。
@@ -957,10 +971,6 @@ parse_args() {
     CLI_CONFIG=""
     CLI_TAP=""
     CLI_FORMULA=""
-    CLI_VERSION_FILE=""
-    CLI_VERSION_KEY=""
-    CLI_CHECK=""
-    CLI_HAS_CHECK=0
     CLI_TAG_PREFIX=""
     CLI_HAS_TAG_PREFIX=0
     INIT_MODE=0
@@ -1012,24 +1022,8 @@ parse_args() {
                 shift 2
                 ;;
             --formula)
-                [[ $# -ge 2 ]] || die "--formula 需要相对路径"
+                [[ $# -ge 2 ]] || die "--formula 需要文件名，例如: --formula brew-publish-formula.rb"
                 CLI_FORMULA="$2"
-                shift 2
-                ;;
-            --version-file)
-                [[ $# -ge 2 ]] || die "--version-file 需要相对路径"
-                CLI_VERSION_FILE="$2"
-                shift 2
-                ;;
-            --version-key)
-                [[ $# -ge 2 ]] || die "--version-key 需要变量名"
-                CLI_VERSION_KEY="$2"
-                shift 2
-                ;;
-            --check)
-                [[ $# -ge 2 ]] || die "--check 需要脚本路径，或 none"
-                CLI_CHECK="$2"
-                CLI_HAS_CHECK=1
                 shift 2
                 ;;
             --tag-prefix)
@@ -1058,8 +1052,7 @@ parse_args() {
     if [[ "$INIT_MODE" -eq 1 ]]; then
         if [[ -n "$BUMP_TYPE" || -n "$EXPLICIT_VERSION" || "$DRY_RUN" -eq 1 \
             || "$SKIP_CHECK" -eq 1 || "$SKIP_TAP_AUDIT" -eq 1 || "$PUSH_REMOTE" -eq 0 \
-            || -n "$CLI_FORMULA" || -n "$CLI_VERSION_FILE" || -n "$CLI_VERSION_KEY" \
-            || "$CLI_HAS_CHECK" -eq 1 || "$CLI_HAS_TAG_PREFIX" -eq 1 ]]; then
+            || -n "$CLI_FORMULA" || "$CLI_HAS_TAG_PREFIX" -eq 1 ]]; then
             die "--init 不能与发布参数一起使用。可以同时使用 --tap 或 --config"
         fi
         return 0
@@ -1074,15 +1067,11 @@ parse_args() {
 }
 
 apply_project_settings() {
-    local config_path tap_value formula_value check_value
+    local config_path tap_value formula_value
     config_path="$CONFIG_PATH"
     CFG_TAP=""
     CFG_FORMULA=""
-    CFG_VERSION_FILE=""
-    CFG_VERSION_KEY=""
-    CFG_CHECK=""
     CFG_TAG_PREFIX=""
-    CFG_HAS_CHECK=0
     CFG_HAS_TAG_PREFIX=0
     if [[ -n "$config_path" ]]; then
         log "读取配置: ${config_path}"
@@ -1090,7 +1079,7 @@ apply_project_settings() {
     fi
 
     tap_value="${CLI_TAP:-$CFG_TAP}"
-    [[ -n "$tap_value" ]] || die "未配置 tap。请在 formula/brew-publish.conf 中设置 tap=，或使用 --tap"
+    [[ -n "$tap_value" ]] || die "未配置 tap。请在 .formula/brew-publish.conf 中设置 tap=，或使用 --tap"
     normalize_tap "$tap_value"
 
     formula_value="${CLI_FORMULA:-$CFG_FORMULA}"
@@ -1098,19 +1087,6 @@ apply_project_settings() {
     FORMULA_NAME="$(basename "$FORMULA_FILE" .rb)"
     if [[ ! "$FORMULA_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9+@._-]*$ ]]; then
         die "无法从文件名得到 formula 名称: $FORMULA_FILE"
-    fi
-
-    VERSION_FILE="${CLI_VERSION_FILE:-$CFG_VERSION_FILE}"
-    VERSION_KEY="${CLI_VERSION_KEY:-$CFG_VERSION_KEY}"
-    if [[ -n "$VERSION_FILE" ]]; then
-        VERSION_FILE="$(normalize_repo_path "$VERSION_FILE" "version_file")"
-        [[ -f "$VERSION_FILE" ]] || die "版本文件不存在: $VERSION_FILE"
-    fi
-    if [[ -n "$VERSION_FILE" && -z "$VERSION_KEY" ]]; then
-        die "已设置版本文件，但缺少 version_key"
-    fi
-    if [[ -z "$VERSION_FILE" && -n "$VERSION_KEY" ]]; then
-        die "已设置 version_key，但缺少 version_file"
     fi
 
     if [[ "$CLI_HAS_TAG_PREFIX" -eq 1 ]]; then
@@ -1123,15 +1099,6 @@ apply_project_settings() {
     case "$TAG_PREFIX" in
         *[[:space:]/]*) die "tag_prefix 不能包含空白或斜杠: $TAG_PREFIX" ;;
     esac
-
-    if [[ "$CLI_HAS_CHECK" -eq 1 ]]; then
-        check_value="$CLI_CHECK"
-    elif [[ "$CFG_HAS_CHECK" -eq 1 ]]; then
-        check_value="$CFG_CHECK"
-    else
-        check_value=""
-    fi
-    CHECK_SCRIPT="$(resolve_check_script "$check_value")"
 }
 
 load_github_origin() {
@@ -1159,15 +1126,13 @@ print_plan() {
         mode_label="full"
     fi
     bump_label="${BUMP_TYPE:-explicit}"
-    if [[ -n "$VERSION_FILE" ]]; then
-        version_source="${VERSION_FILE} (${VERSION_KEY})"
+    if [[ "$HAS_RELEASE_TAG" -eq 1 ]]; then
+        version_source="git tag"
     else
-        version_source="formula version"
+        version_source="${FORMULA_FILE} 的 url"
     fi
     if [[ "$SKIP_CHECK" -eq 1 ]]; then
         check_label="skip"
-    elif [[ -n "$CHECK_SCRIPT" ]]; then
-        check_label="$CHECK_SCRIPT"
     elif [[ -n "$(builtin_shellcheck_target)" ]]; then
         check_label="shellcheck $(builtin_shellcheck_target)"
     else
@@ -1187,7 +1152,7 @@ print_plan() {
   GitHub   : ${GITHUB_OWNER}/${GITHUB_REPO}
   Formula  : ${FORMULA_FILE}
   版本来源 : ${version_source}
-  检查脚本 : ${check_label}
+  检查     : ${check_label}
   Tap 仓库 : ${TAP_PATH}
   Tap 文件 : ${TAP_FORMULA_PATH}
   dry-run  : ${DRY_RUN}
@@ -1202,15 +1167,9 @@ sync_formula_contents() {
     local hash="$2"
     if [[ "$DRY_RUN" -eq 1 ]]; then
         printf '[dry-run] 更新 %s 的 url 与 sha256 → %s\n' "$FORMULA_FILE" "$hash"
-        if [[ -n "$VERSION_FILE" ]]; then
-            printf '[dry-run] 更新 %s 的 %s → %s\n' "$VERSION_FILE" "$VERSION_KEY" "$version"
-        fi
         return 0
     fi
     update_formula_file "$FORMULA_FILE" "$ARCHIVE_URL" "$hash" "$version"
-    if [[ -n "$VERSION_FILE" ]]; then
-        update_version_file "$VERSION_FILE" "$VERSION_KEY" "$version"
-    fi
 }
 
 # Homebrew 类名：brew-publish-formula → BrewPublishFormula。
@@ -1247,30 +1206,30 @@ formula_class_name() {
 list_formula_rb() {
     local path
     FORMULA_RB_FILES=()
-    if [[ ! -d formula ]]; then
+    if [[ ! -d .formula ]]; then
         return 0
     fi
     while IFS= read -r path; do
         [[ -n "$path" ]] || continue
         FORMULA_RB_FILES+=("$path")
-    done < <(find formula -maxdepth 1 -name '*.rb' -print | sort)
+    done < <(find .formula -maxdepth 1 -name '*.rb' -print | sort)
 }
 
-# 已有配置返回其路径。没有配置时返回将要创建的 formula/brew-publish.conf。
+# 已有配置返回其路径。没有配置时返回将要创建的 .formula/brew-publish.conf。
 init_config_path() {
     if [[ -n "$CLI_CONFIG" ]]; then
         normalize_repo_path "$CLI_CONFIG" "config"
         return 0
     fi
-    if [[ -f formula/brew-publish.conf ]]; then
-        printf '%s\n' "formula/brew-publish.conf"
+    if [[ -f .formula/brew-publish.conf ]]; then
+        printf '%s\n' ".formula/brew-publish.conf"
         return 0
     fi
     if [[ -f .brew-publish.conf ]]; then
         printf '%s\n' ".brew-publish.conf"
         return 0
     fi
-    printf '%s\n' "formula/brew-publish.conf"
+    printf '%s\n' ".formula/brew-publish.conf"
 }
 
 write_formula_template() {
@@ -1313,20 +1272,40 @@ tag_prefix=v
 EOF
 }
 
+# 目标 .rb 不存在时：Tap 里有同名文件就复制，没有则询问是否生成模板。
+init_missing_formula() {
+    local dest="$1"
+    local formula_name="$2"
+    local class_name="$3"
+    local version="$4"
+    local tap_path="" source_rb=""
+    if tap_path="$(ensure_local_tap)"; then
+        if source_rb="$(find_tap_formula_file "$tap_path" "$formula_name")"; then
+            mkdir -p "$(dirname "$dest")"
+            cp "$source_rb" "$dest"
+            log "已从 Tap 复制 formula: ${source_rb} → ${dest}"
+            return 0
+        fi
+        log "Tap 中没有 ${formula_name}.rb"
+    fi
+    if confirm "是否创建 formula 模板 ${dest}？"; then
+        write_formula_template "$dest" "$formula_name" "$class_name" "$version"
+        log "已创建 formula 模板: ${dest}"
+        log "请按项目修改其中的 desc、license 和 install"
+        return 0
+    fi
+    log "未创建 formula 模板"
+}
+
 # 生成缺失的配置和 formula。已有文件不会覆盖。
 run_init() {
-    local conf_path formula_rel formula_name class_name version tap
-    local created_conf=0 created_rb=0
+    local conf_path formula_file_name formula_name class_name version tap formula_dest
     load_github_origin
     list_formula_rb
 
     formula_name="$(printf '%s' "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')"
     if [[ ! "$formula_name" =~ ^[a-z][a-z0-9+@._-]*$ ]]; then
         die "仓库名不能用作 formula 文件名: ${GITHUB_REPO}"
-    fi
-    class_name="$(formula_class_name "$formula_name")"
-    if [[ ! "$class_name" =~ ^[A-Z][A-Za-z0-9]*$ ]]; then
-        die "无法从仓库名得到 formula 类名: ${formula_name}"
     fi
 
     TAG_PREFIX="v"
@@ -1344,40 +1323,45 @@ run_init() {
     normalize_tap "$tap"
 
     conf_path="$(init_config_path)"
-    if [[ ${#FORMULA_RB_FILES[@]} -eq 1 ]]; then
-        formula_rel="${FORMULA_RB_FILES[0]}"
-    elif [[ ${#FORMULA_RB_FILES[@]} -eq 0 ]]; then
-        formula_rel="formula/${formula_name}.rb"
-    else
-        formula_rel=""
+    formula_file_name=""
+    if [[ -f "$conf_path" ]]; then
+        load_config_file "$conf_path"
+        if [[ -n "$CFG_FORMULA" ]]; then
+            formula_file_name="$(formula_basename "$CFG_FORMULA")"
+        fi
     fi
-
-    if [[ ! -f "$conf_path" ]]; then
-        if [[ -z "$formula_rel" ]]; then
-            die "formula/ 下有多个 .rb，无法决定配置里的 formula=。请只保留一个，或先写好配置并指定 formula=：
+    if [[ -z "$formula_file_name" ]]; then
+        if [[ ${#FORMULA_RB_FILES[@]} -eq 1 ]]; then
+            formula_file_name="$(basename "${FORMULA_RB_FILES[0]}")"
+        elif [[ ${#FORMULA_RB_FILES[@]} -eq 0 ]]; then
+            formula_file_name="${formula_name}.rb"
+        else
+            die ".formula/ 下有多个 .rb，无法决定配置里的 formula=。请只保留一个，或先写好配置并指定 formula=文件名.rb：
 $(printf '  %s\n' "${FORMULA_RB_FILES[@]}")"
         fi
-        write_publish_config "$conf_path" "$tap" "$formula_rel"
-        created_conf=1
+    fi
+
+    formula_name="${formula_file_name%.rb}"
+    class_name="$(formula_class_name "$formula_name")"
+    if [[ ! "$class_name" =~ ^[A-Z][A-Za-z0-9]*$ ]]; then
+        die "无法从文件名得到 formula 类名: ${formula_name}"
+    fi
+    formula_dest=".formula/${formula_file_name}"
+
+    if [[ ! -f "$conf_path" ]]; then
+        write_publish_config "$conf_path" "$tap" "$formula_file_name"
         log "已创建配置: ${conf_path}"
     else
         log "配置已存在，保持不变: ${conf_path}"
-    fi
-
-    if [[ ${#FORMULA_RB_FILES[@]} -eq 0 ]]; then
-        write_formula_template "$formula_rel" "$formula_name" "$class_name" "$version"
-        created_rb=1
-        log "已创建 formula: ${formula_rel}"
-        log "请按项目修改其中的 desc、license 和 install"
-        if [[ "$created_conf" -eq 0 ]] && ! grep -q '^[[:space:]]*formula=' "$conf_path"; then
-            warn "请在 ${conf_path} 中设置 formula=${formula_rel}"
+        if ! grep -q '^[[:space:]]*formula=' "$conf_path"; then
+            warn "请在 ${conf_path} 中设置 formula=${formula_file_name}"
         fi
-    else
-        log "formula/ 下已有 .rb，未新建 formula"
     fi
 
-    if [[ "$created_conf" -eq 0 && "$created_rb" -eq 0 ]]; then
-        log "没有需要创建的文件"
+    if [[ -f "$formula_dest" ]]; then
+        log "formula 已存在，保持不变: ${formula_dest}"
+    else
+        init_missing_formula "$formula_dest" "$formula_name" "$class_name" "$version"
     fi
 }
 
@@ -1428,10 +1412,7 @@ main() {
         fi
 
         if [[ "$SKIP_CHECK" -eq 1 ]]; then
-            warn "已跳过检查脚本"
-        elif [[ -n "$CHECK_SCRIPT" ]]; then
-            log "运行 ${CHECK_SCRIPT}"
-            run_cmd bash "$CHECK_SCRIPT"
+            warn "已跳过 shellcheck"
         elif [[ -n "$(builtin_shellcheck_target)" ]]; then
             log "运行 shellcheck $(builtin_shellcheck_target)"
             if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -1439,22 +1420,13 @@ main() {
             else
                 run_builtin_shellcheck "$(builtin_shellcheck_target)"
             fi
-        else
-            log "没有检查脚本，跳过"
         fi
 
-        if [[ -n "$VERSION_FILE" ]]; then
-            log "更新 ${VERSION_FILE} 中的 ${VERSION_KEY} → ${NEW_VERSION}"
-        else
-            log "更新 ${FORMULA_FILE} 的 url → ${ARCHIVE_URL}"
-        fi
+        log "更新 ${FORMULA_FILE} 的 url → ${ARCHIVE_URL}"
         if [[ "$DRY_RUN" -eq 0 ]]; then
             ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION" "$ARCHIVE_URL"
             git add -- "$FORMULA_FILE"
-            if [[ -n "$VERSION_FILE" ]]; then
-                update_version_file "$VERSION_FILE" "$VERSION_KEY" "$NEW_VERSION"
-                git add -- "$VERSION_FILE"
-            elif [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
+            if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
                 update_version_file brew-publish-formula TOOL_VERSION "$NEW_VERSION"
                 git add -- brew-publish-formula
             fi
@@ -1462,9 +1434,9 @@ main() {
         else
             printf '[dry-run] 更新 %s 的 url → %s\n' "$FORMULA_FILE" "$ARCHIVE_URL"
             run_cmd git add -- "$FORMULA_FILE"
-            if [[ -n "$VERSION_FILE" ]]; then
-                printf '[dry-run] 更新 %s 的 %s → %s\n' "$VERSION_FILE" "$VERSION_KEY" "$NEW_VERSION"
-                run_cmd git add -- "$VERSION_FILE"
+            if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
+                printf '[dry-run] 更新 brew-publish-formula 的 TOOL_VERSION → %s\n' "$NEW_VERSION"
+                run_cmd git add -- brew-publish-formula
             fi
             run_cmd git commit -m "chore: bump version to ${NEW_VERSION}"
         fi
@@ -1508,18 +1480,12 @@ main() {
     log "提交项目仓库中的 formula 更新"
     if [[ "$DRY_RUN" -eq 0 ]]; then
         git add -- "$FORMULA_FILE"
-        if [[ -n "$VERSION_FILE" ]]; then
-            git add -- "$VERSION_FILE"
-        fi
         commit_if_staged "chore: update formula for ${NEW_TAG}"
         if [[ "$PUSH_REMOTE" -eq 1 ]]; then
             git_push_origin_head
         fi
     else
         run_cmd git add -- "$FORMULA_FILE"
-        if [[ -n "$VERSION_FILE" ]]; then
-            run_cmd git add -- "$VERSION_FILE"
-        fi
         run_cmd git commit -m "chore: update formula for ${NEW_TAG}"
         if [[ "$PUSH_REMOTE" -eq 1 ]]; then
             run_cmd git push origin HEAD
