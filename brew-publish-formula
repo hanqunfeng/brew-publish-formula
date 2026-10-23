@@ -55,7 +55,8 @@
 #   --init              缺少配置时生成 .formula/brew-publish.conf。
 #                       .formula/ 下没有目标 .rb 时，先看本地 Tap：
 #                       Tap 不存在则询问是否创建；Tap 里已有同名 .rb 则复制过来；
-#                       没有则询问是否生成模板。独立命令，不发布
+#                       没有则询问是否生成模板。并把 .formula 写入 .gitignore，
+#                       没有该文件时会创建。独立命令，不发布
 #   -h, --help          显示本说明
 #
 # 前置条件:
@@ -1297,9 +1298,35 @@ init_missing_formula() {
     log "未创建 formula 模板"
 }
 
+# 把 .formula 写入 .gitignore。文件不存在时创建。已有相同规则时不重复添加。
+ensure_formula_gitignored() {
+    local line trimmed
+    if [[ -f .gitignore ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%$'\r'}"
+            trimmed="$(trim "$line")"
+            case "$trimmed" in
+                .formula|.formula/|/.formula|/.formula/)
+                    log ".gitignore 已忽略 .formula"
+                    return 0
+                    ;;
+            esac
+        done < .gitignore
+        if [[ -s .gitignore ]] && [[ -n "$(tail -c 1 .gitignore)" ]]; then
+            printf '\n' >> .gitignore
+        fi
+        printf '%s\n' '.formula' >> .gitignore
+        log "已把 .formula 写入 .gitignore"
+        return 0
+    fi
+    printf '%s\n' '.formula' > .gitignore
+    log "已创建 .gitignore，并忽略 .formula"
+}
+
 # 生成缺失的配置和 formula。已有文件不会覆盖。
 run_init() {
     local conf_path formula_file_name formula_name class_name version tap formula_dest
+    ensure_formula_gitignored
     load_github_origin
     list_formula_rb
 
@@ -1425,7 +1452,7 @@ main() {
         log "更新 ${FORMULA_FILE} 的 url → ${ARCHIVE_URL}"
         if [[ "$DRY_RUN" -eq 0 ]]; then
             ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION" "$ARCHIVE_URL"
-            git add -- "$FORMULA_FILE"
+            git add -f -- "$FORMULA_FILE"
             if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
                 update_version_file brew-publish-formula TOOL_VERSION "$NEW_VERSION"
                 git add -- brew-publish-formula
@@ -1433,7 +1460,7 @@ main() {
             commit_if_staged "chore: bump version to ${NEW_VERSION}"
         else
             printf '[dry-run] 更新 %s 的 url → %s\n' "$FORMULA_FILE" "$ARCHIVE_URL"
-            run_cmd git add -- "$FORMULA_FILE"
+            run_cmd git add -f -- "$FORMULA_FILE"
             if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
                 printf '[dry-run] 更新 brew-publish-formula 的 TOOL_VERSION → %s\n' "$NEW_VERSION"
                 run_cmd git add -- brew-publish-formula
@@ -1479,13 +1506,13 @@ main() {
 
     log "提交项目仓库中的 formula 更新"
     if [[ "$DRY_RUN" -eq 0 ]]; then
-        git add -- "$FORMULA_FILE"
+        git add -f -- "$FORMULA_FILE"
         commit_if_staged "chore: update formula for ${NEW_TAG}"
         if [[ "$PUSH_REMOTE" -eq 1 ]]; then
             git_push_origin_head
         fi
     else
-        run_cmd git add -- "$FORMULA_FILE"
+        run_cmd git add -f -- "$FORMULA_FILE"
         run_cmd git commit -m "chore: update formula for ${NEW_TAG}"
         if [[ "$PUSH_REMOTE" -eq 1 ]]; then
             run_cmd git push origin HEAD
@@ -1518,7 +1545,7 @@ main() {
         if ! cmp -s "$FORMULA_FILE" "$TAP_FORMULA_PATH"; then
             log "brew style 修改了 formula，回同步到项目仓库"
             cp "$TAP_FORMULA_PATH" "$FORMULA_FILE"
-            git add -- "$FORMULA_FILE"
+            git add -f -- "$FORMULA_FILE"
             commit_if_staged "chore: apply brew style fixes for ${NEW_TAG}"
             if [[ "$PUSH_REMOTE" -eq 1 ]]; then
                 git_push_origin_head

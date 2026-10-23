@@ -64,7 +64,7 @@ brew update && brew upgrade brew-publish-formula
 brew-publish-formula --init
 ```
 
-`--init` 会生成 `.formula/brew-publish.conf`。`formula=` 只写文件名，公式文件固定放在 `.formula/` 下。已有配置和已有 `.rb` 不会被覆盖。可以用 `--tap user/homebrew-tap` 指定写入配置的 Tap。
+`--init` 会生成 `.formula/brew-publish.conf`，并把 `.formula` 写入 `.gitignore`。没有 `.gitignore` 时会创建。`formula=` 只写文件名，公式文件固定放在 `.formula/` 下。已有配置和已有 `.rb` 不会被覆盖。可以用 `--tap user/homebrew-tap` 指定写入配置的 Tap。
 
 目标 `.rb` 还不存在时：
 
