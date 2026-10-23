@@ -32,8 +32,10 @@ export PATH="$HOME/brew-publish-formula:$PATH"
 新开一个终端后确认：
 
 ```bash
-brew-publish-formula --help
+brew-publish-formula --help --zh
 ```
+
+`--help` 显示英文说明。`--help --zh` 显示中文说明。其他命令加上 `--zh` 后，运行时的提示也使用中文。
 
 ### 从 Homebrew 安装
 

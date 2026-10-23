@@ -35,6 +35,8 @@ Open a new terminal and confirm:
 brew-publish-formula --help
 ```
 
+`--help` prints English help. `--help --zh` prints Chinese help. Add `--zh` to any command to print runtime messages in Chinese.
+
 ### From Homebrew
 
 After this repository's formula has been published to the Tap:
