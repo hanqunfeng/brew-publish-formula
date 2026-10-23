@@ -1,76 +1,78 @@
 # brew-publish-formula
 
-在项目根目录执行的 Homebrew 发布命令。它根据当前仓库计算新版本、推送 tag、更新 formula 的 `url` / `sha256`，再把 formula 同步到本地 Tap。
+[中文](README.zh-CN.md)
 
-当前工作目录就是要发布的项目根目录。命令从这个目录读取配置、formula 和 git 信息。
+A Homebrew release command that runs in a project root. It computes the next version from the current repository, pushes a tag, updates the formula `url` and `sha256`, then copies the formula into the local Tap.
 
-## 安装
+The working directory is the project being published. The command reads its config, formula, and git information from that directory.
 
-依赖：
+## Install
 
-- git、curl、ruby、Homebrew
-- `shasum` 或 `sha256sum`
-- 发布本仓库时，命令会用 shellcheck 检查主文件
+Requirements:
 
-### 从 GitHub 安装
+- git, curl, ruby, and Homebrew
+- `shasum` or `sha256sum`
+- shellcheck, used when publishing this repository
 
-克隆仓库，确认脚本可执行，并把克隆目录加入 `PATH`：
+### From GitHub
+
+Clone the repository, make the script executable, and add the clone to `PATH`:
 
 ```bash
 git clone https://github.com/hanqunfeng/brew-publish-formula.git ~/brew-publish-formula
 chmod +x ~/brew-publish-formula/brew-publish-formula
 ```
 
-在 `~/.zshrc` 中加入：
+Add this to `~/.zshrc`:
 
 ```bash
 export PATH="$HOME/brew-publish-formula:$PATH"
 ```
 
-新开一个终端后确认：
+Open a new terminal and confirm:
 
 ```bash
 brew-publish-formula --help
 ```
 
-### 从 Homebrew 安装
+### From Homebrew
 
-本仓库的 formula 发布到 Tap 之后：
+After this repository's formula has been published to the Tap:
 
 ```bash
 brew tap hanqunfeng/tap
 brew install brew-publish-formula
 ```
 
-或一行安装：
+Or in one line:
 
 ```bash
 brew install hanqunfeng/tap/brew-publish-formula
 ```
 
-升级：
+Upgrade:
 
 ```bash
 brew update && brew upgrade brew-publish-formula
 ```
 
-`.formula/*.rb` 里的 `sha256` 在第一次成功发布前可以是占位值。发布命令会在 tag 推送后写成真实哈希，再把这份文件复制到 Tap 并提交。`.formula` 不会进入项目仓库。
+The `sha256` in `.formula/*.rb` may be a placeholder until the first successful publish. After the tag is pushed, the command writes the real hash, copies the file into the Tap, and commits it there. `.formula` is not added to the project repository.
 
-## 项目配置
+## Project config
 
-在要发布的仓库根目录放置 `.formula/brew-publish.conf`。根目录的 `.brew-publish.conf` 也可以，`--config` 指定的文件优先。确认当前目录是 git 仓库根目录后，命令会立刻检查这些位置是否有配置文件，没有则停止，并提示运行：
+Place `.formula/brew-publish.conf` in the root of the repository you want to publish. `.brew-publish.conf` in the root also works. A file given with `--config` takes priority. After confirming that the current directory is the git root, the command looks for a config in those locations and stops if none exists, telling you to run:
 
 ```bash
 brew-publish-formula --init
 ```
 
-`--init` 会生成 `.formula/brew-publish.conf`，并把 `.formula` 写入 `.gitignore`。没有 `.gitignore` 时会创建。`formula=` 只写文件名，公式文件固定放在 `.formula/` 下。已有配置和已有 `.rb` 不会被覆盖。可以用 `--tap user/homebrew-tap` 指定写入配置的 Tap。
+`--init` creates `.formula/brew-publish.conf` and adds `.formula` to `.gitignore`. It creates `.gitignore` when that file is missing. `formula=` is a filename only; the formula file always lives under `.formula/`. Existing config and `.rb` files are left unchanged. Pass `--tap user/homebrew-tap` to choose the Tap written into a new config.
 
-目标 `.rb` 还不存在时：
+When the target `.rb` does not exist yet:
 
-1. 先看本地有没有配置里的 Tap。没有则询问是否执行 `brew tap-new`。
-2. Tap 里已有同名 `.rb` 时，复制到 `.formula/`。
-3. Tap 里也没有时，询问是否生成公式模板。
+1. Look for the configured Tap locally. If it is missing, ask whether to run `brew tap-new`.
+2. If the Tap already has a formula with the same name, copy it into `.formula/`.
+3. If the Tap does not have one either, ask whether to write a formula template.
 
 ```text
 tap=hanqunfeng/homebrew-tap
@@ -78,25 +80,25 @@ formula=brew-publish-formula.rb
 tag_prefix=v
 ```
 
-| 键 | 含义 |
+| Key | Meaning |
 | --- | --- |
-| `tap` | `user/homebrew-tap` 或 `user/tap`。发布前会检查本地是否已有该 Tap；没有则先执行 `brew tap-new user/homebrew-tap` |
-| `formula` | 文件名，例如 `brew-publish-formula.rb`。实际路径是 `.formula/` 加上这个文件名。省略时，`.formula/` 下只能有一个 `*.rb` |
-| `tag_prefix` | 可选，默认 `v`，生成 `v1.2.3` |
+| `tap` | `user/homebrew-tap` or `user/tap`. Before publishing, the command checks that this Tap exists locally. If it does not, create it with `brew tap-new user/homebrew-tap` |
+| `formula` | A filename such as `brew-publish-formula.rb`. The path is `.formula/` plus that name. When omitted, `.formula/` must contain exactly one `*.rb` |
+| `tag_prefix` | Optional. Defaults to `v`, producing `v1.2.3` |
 
-`origin` 必须指向 GitHub。源码包地址和 tag 推送都使用这个远程：
+`origin` must point at GitHub. The archive URL and the tag push both use that remote:
 
 ```text
 https://github.com/<owner>/<repo>/archive/refs/tags/vX.Y.Z.tar.gz
 ```
 
-`url` 里直接写 tag，例如 `v1.2.3`。Homebrew 会从这段地址识别版本，所以公式里不再单独写 `version`。再写一行相同的 `version` 时，`brew audit` 会报 redundant。发布时会把 `url` 里的 tag 改成新版本，并更新 `sha256`。
+Write the tag directly in `url`, for example `v1.2.3`. Homebrew reads the version from that URL, so the formula does not also declare `version`. A matching `version` line makes `brew audit` report it as redundant. A publish rewrites the tag in `url` and updates `sha256`.
 
-版本号优先取最新的语义化 tag。没有 tag 时从 formula 的 `url` 读取。都没有时按 `0.0.0` 递增。第一次打 tag 可以用 `--version` 指定版本，不必先有历史 tag。
+The version comes from the latest semver tag. With no tag, it is read from the formula `url`. With neither, the next version starts from `0.0.0`. The first tag can be set with `--version`; earlier tags are not required.
 
-## 发布
+## Publish
 
-在项目根目录执行：
+Run this in the project root:
 
 ```bash
 brew-publish-formula patch --dry-run
@@ -107,40 +109,40 @@ brew-publish-formula --version 1.2.0
 brew-publish-formula --resume 1.0.6 --yes
 ```
 
-命令会先打印发布计划，确认后执行。`--yes` 跳过确认。
+The command prints the release plan and waits for confirmation. `--yes` skips the prompt.
 
-| 选项 | 含义 |
+| Option | Meaning |
 | --- | --- |
-| `--dry-run` | 只打印将执行的操作 |
-| `--yes` / `-y` | 跳过交互确认 |
-| `--skip-check` | 发布本仓库时跳过 shellcheck |
-| `--skip-tap-audit` | 跳过 `brew style` / `brew audit` |
-| `--no-push` | 不推远程。本地 tag 创建后会停止，因为还不能计算 sha256 |
-| `--resume X.Y.Z` | tag 已经推送时，从下载源码包继续 |
-| `--tap` `--formula` `--tag-prefix` `--config` | 覆盖配置文件中的对应项 |
+| `--dry-run` | Print the operations that would run |
+| `--yes` / `-y` | Skip the confirmation prompt |
+| `--skip-check` | Skip shellcheck when publishing this repository |
+| `--skip-tap-audit` | Skip `brew style` / `brew audit` |
+| `--no-push` | Do not push. The command stops after creating the local tag, because `sha256` cannot be computed yet |
+| `--resume X.Y.Z` | Continue from the archive download when the tag is already pushed |
+| `--tap` `--formula` `--tag-prefix` `--config` | Override the matching config keys |
 
-全量发布要求工作区干净。`.formula` 被忽略时，其中的修改不会出现在 `git status` 里。`--resume` 时，若公式文件仍被跟踪，只允许它和 `brew-publish-formula` 已修改。
+A full publish requires a clean worktree. Changes under an ignored `.formula` do not appear in `git status`. On `--resume`, if the formula file is still tracked, only that file and `brew-publish-formula` may be modified.
 
-正确的 `sha256` 只能在 tag 到达 GitHub 之后得到。脚本把它写入本地 `.formula`，再复制到 Tap。提交发生在 Tap 仓库，不发生在项目仓库。Homebrew 读取 Tap 里的 formula。
+The real `sha256` is available only after the tag reaches GitHub. The script writes it into the local `.formula` file, then copies that file into the Tap. The commit is made in the Tap repository, not in the project repository. Homebrew reads the formula from the Tap.
 
-tag 已推送但后续失败时，用 `--resume` 继续，不要再次 bump。
+If the tag was pushed and a later step failed, continue with `--resume`. Do not bump the version again.
 
-## 发布后验证
+## Verify after publishing
 
 ```bash
 brew update
 brew upgrade <formula-name>
 ```
 
-也可以用项目里的 formula 文件做一次本地安装：
+You can also install once from the formula file in the project:
 
 ```bash
 brew install --build-from-source ./.formula/<formula-name>.rb
 ```
 
-## 接入已有项目
+## Add it to an existing project
 
-以 `java-project-generator` 为例，在该仓库新增 `.formula/brew-publish.conf`：
+For `java-project-generator`, add `.formula/brew-publish.conf` to that repository:
 
 ```text
 tap=hanqunfeng/homebrew-tap
@@ -148,12 +150,12 @@ formula=java-project-generator.rb
 tag_prefix=v
 ```
 
-之后在该仓库根目录执行 `brew-publish-formula patch`。
+Then run `brew-publish-formula patch` in that repository's root.
 
-## 开发本仓库
+## Develop this repository
 
 ```bash
 shellcheck brew-publish-formula
 ```
 
-发布本仓库时也会执行同样的检查。`--skip-check` 可以跳过。
+Publishing this repository runs the same check. `--skip-check` skips it.

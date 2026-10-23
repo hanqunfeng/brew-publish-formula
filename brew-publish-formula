@@ -78,15 +78,57 @@
 # 命令自身在 --help 中显示的版本。发布本仓库时会随新版本一起更新。
 TOOL_VERSION="1.0.1"
 
-# 连接 GitHub 失败时的重试次数，以及第一次失败后的等待秒数。之后每次再加 2 秒。
+# 连接 GitHub 失败时最多重试的次数。
 GITHUB_RETRY_ATTEMPTS=8
+# 第一次失败后的等待秒数。之后每次再加 2 秒。
 GITHUB_RETRY_INITIAL_DELAY=3
 
-# 日志走 stderr，避免污染 $(...) 的返回值。
+# 运行期全局变量。初值在对应函数里写入，这里只说明含义。
+# TAP_FULL              带 homebrew- 前缀的 Tap，例如 user/homebrew-tap。
+# TAP_SHORT             brew 命令使用的短名，例如 user/tap。
+# CFG_TAP               配置文件中的 tap。
+# CFG_FORMULA           配置文件中的 formula 文件名。
+# CFG_TAG_PREFIX        配置文件中的 tag 前缀。
+# CFG_HAS_TAG_PREFIX    配置是否写了 tag_prefix。1 表示写了，空字符串也算写了。
+# PROJECT_ROOT          当前项目的 git 根目录绝对路径。
+# CONFIG_PATH           实际读到的配置文件路径。
+# BUMP_TYPE             patch、minor 或 major。与显式版本互斥。
+# EXPLICIT_VERSION      --version 或 --resume 给出的 X.Y.Z。
+# RESUME_MODE           1 表示 tag 已存在，从计算 sha256 继续。
+# DRY_RUN               1 表示只打印计划，不改文件、不推送。
+# SKIP_CHECK            1 表示跳过 shellcheck。
+# SKIP_TAP_AUDIT        1 表示跳过 brew style / brew audit。
+# ASSUME_YES            1 表示跳过交互确认。
+# PUSH_REMOTE           1 表示推送 origin。--no-push 时为 0。
+# CLI_CONFIG            --config 指定的配置文件。
+# CLI_TAP               --tap 覆盖的 Tap。
+# CLI_FORMULA           --formula 覆盖的公式文件名。
+# CLI_TAG_PREFIX        --tag-prefix 覆盖的前缀。
+# CLI_HAS_TAG_PREFIX    1 表示命令行写了 --tag-prefix。
+# INIT_MODE             1 表示只执行 --init，不发布。
+# FORMULA_FILE          项目内公式路径，形如 .formula/name.rb。
+# FORMULA_NAME          公式名，即文件名去掉 .rb。
+# TAG_PREFIX            最终使用的 tag 前缀，默认 v。
+# HAS_RELEASE_TAG       1 表示仓库里已有语义化 tag。
+# CURRENT_VERSION       当前版本，来自最新 tag、公式 url 或 0.0.0。
+# GITHUB_OWNER          origin 解析出的 GitHub 用户或组织。
+# GITHUB_REPO           origin 解析出的仓库名。
+# NEW_VERSION           本次要发布的 X.Y.Z。
+# NEW_TAG               本次 tag，由前缀加新版本组成。
+# ARCHIVE_URL           该 tag 的 GitHub 源码包地址。
+# NEW_SHA256            源码包的 sha256。dry-run 时是占位文本。
+# TAP_PATH              本地 Tap 仓库目录。
+# TAP_FORMULA_PATH      Tap 中公式文件的目标路径。
+# FORMULA_RB_FILES      --init 时扫到的 .formula/*.rb 列表。
+
+# 向 stderr 打印进度，避免污染 $(...) 的返回值。参数是要显示的消息。
 log()  { printf '==> %s\n' "$*" >&2; }
+# 向 stderr 打印警告，流程继续。参数是警告内容。
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
+# 向 stderr 打印错误并退出。参数是错误内容。
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# 打印文件头部的用法说明，并附上 TOOL_VERSION。参数是退出码，省略时为 0。
 usage() {
     awk '
         NR == 1 { next }
@@ -103,17 +145,17 @@ usage() {
     exit "${1:-0}"
 }
 
-# 去掉首尾空白。
+# 去掉首尾空白，结果写到 stdout。
 trim() {
-    local s="$1"
+    local s="$1"   # 原始字符串
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
     printf '%s\n' "$s"
 }
 
-# 只接受 X.Y.Z 或 vX.Y.Z。
+# 校验版本并去掉可选的 v 前缀，结果写到 stdout。
 normalize_version() {
-    local raw="$1"
+    local raw="$1"   # 用户输入，形如 1.2.3 或 v1.2.3
     raw="${raw#v}"
     if [[ ! "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         die "非法版本号: $1（期望格式: X.Y.Z 或 vX.Y.Z）"
@@ -121,12 +163,12 @@ normalize_version() {
     printf '%s\n' "$raw"
 }
 
-# 按数值比较语义化版本。a < b 时返回 0。
+# 按数值比较语义化版本。a < b 时返回 0，否则返回 1。
 version_lt() {
-    local a="$1" b="$2"
-    local IFS=.
-    local -a aa bb
-    local i av bv
+    local a="$1" b="$2"   # 左右两个 X.Y.Z
+    local IFS=.           # 按点拆分版本段
+    local -a aa bb        # a、b 拆出的数字段
+    local i av bv         # 段下标，以及当前段的数值
     read -r -a aa <<< "$a"
     read -r -a bb <<< "$b"
     for ((i = 0; i < 3; i++)); do
@@ -142,11 +184,11 @@ version_lt() {
     return 1
 }
 
-# patch: 1.0.5 → 1.0.6；minor: 1.0.5 → 1.1.0；major: 1.0.5 → 2.0.0。
+# 按 bump 类型递增版本，结果写到 stdout。patch 进修订号，minor 进次版本，major 进主版本。
 bump_version() {
-    local current="$1"
-    local bump="$2"
-    local major minor patch
+    local current="$1"    # 当前 X.Y.Z
+    local bump="$2"       # patch、minor 或 major
+    local major minor patch   # 拆开后的三段，按 bump 改写
     IFS='.' read -r major minor patch <<< "$current"
     case "$bump" in
         patch) patch=$((10#$patch + 1)) ;;
@@ -157,9 +199,9 @@ bump_version() {
     printf '%s.%s.%s\n' "$major" "$minor" "$patch"
 }
 
-# 解析 GitHub 远程地址，向 stdout 输出 owner、repo 两行。
+# 解析 GitHub 远程地址。成功时向 stdout 输出 owner、repo 两行，失败返回 1。
 parse_github_remote() {
-    local url="$1"
+    local url="$1"   # origin 地址，支持 https 与 git@ 形式
     url="${url%.git}"
     url="${url%/}"
     if [[ "$url" =~ github\.com[:/]([^/:]+)/([^/]+)$ ]]; then
@@ -169,10 +211,10 @@ parse_github_remote() {
     return 1
 }
 
-# user/tap 与 user/homebrew-tap 都归一成 TAP_FULL / TAP_SHORT。
+# 把 user/tap 或 user/homebrew-tap 写入 TAP_FULL 与 TAP_SHORT。
 normalize_tap() {
-    local tap="$1"
-    local user repo
+    local tap="$1"     # 配置或命令行里的 tap
+    local user repo    # 斜杠两侧的用户名与仓库名
     if [[ ! "$tap" =~ ^([^/]+)/([^/]+)$ ]]; then
         die "tap 格式应为 user/repo 或 user/homebrew-repo: $tap"
     fi
@@ -187,10 +229,10 @@ normalize_tap() {
     fi
 }
 
-# 仓库内相对路径：去掉 ./，拒绝绝对路径和 ..。
+# 校验仓库内相对路径：去掉 ./，拒绝空路径、绝对路径和 ..。结果写到 stdout。
 normalize_repo_path() {
-    local path="$1"
-    local label="$2"
+    local path="$1"    # 待检查的路径
+    local label="$2"   # 出错时用来标明是哪一项配置
     path="$(trim "$path")"
     path="${path#./}"
     if [[ -z "$path" ]]; then
@@ -205,10 +247,10 @@ normalize_repo_path() {
     printf '%s\n' "$path"
 }
 
-# 读取 KEY=VALUE 配置。未知键直接失败，避免拼写错误被静默忽略。
+# 读取 KEY=VALUE 配置，写入 CFG_*。未知键直接失败，避免拼写错误被静默忽略。
 load_config_file() {
-    local file="$1"
-    local line key value
+    local file="$1"       # 配置文件路径
+    local line key value  # 当前行、等号左侧的键、等号右侧的值
     CFG_TAP=""
     CFG_FORMULA=""
     CFG_TAG_PREFIX=""
@@ -239,21 +281,23 @@ load_config_file() {
     done < "$file"
 }
 
+# 读取文件权限的数字模式，写到 stdout。先试 macOS 的 stat，再试 GNU stat。
 file_mode() {
-    local mode
-    mode="$(stat -f '%OLp' "$1" 2>/dev/null || true)"
+    local file="$1"   # 要读取权限的文件
+    local mode        # stat 读到的权限数字
+    mode="$(stat -f '%OLp' "$file" 2>/dev/null || true)"
     if [[ "$mode" =~ ^[0-9]+$ ]]; then
         printf '%s\n' "$mode"
         return 0
     fi
-    stat -c '%a' "$1"
+    stat -c '%a' "$file"
 }
 
-# mktemp 产物默认不可执行。覆盖脚本前要恢复原权限。
+# 用临时文件覆盖目标文件，并保留目标文件原来的权限。mktemp 产物默认不可执行。
 replace_file_preserving_mode() {
-    local dest="$1"
-    local tmp="$2"
-    local mode
+    local dest="$1"   # 要被覆盖的原文件
+    local tmp="$2"    # 已经写好内容的临时文件
+    local mode        # dest 原来的权限
     mode="$(file_mode "$dest")"
     chmod "$mode" "$tmp"
     mv "$tmp" "$dest"
@@ -261,10 +305,10 @@ replace_file_preserving_mode() {
 
 # 把 KEY="旧版本" 整行替换为 KEY="新版本"，保留行首缩进。
 update_version_file() {
-    local file="$1"
-    local key="$2"
-    local version="$3"
-    local tmp awk_status
+    local file="$1"        # 含有 KEY="..." 的文件
+    local key="$2"         # 变量名，例如 TOOL_VERSION
+    local version="$3"     # 要写入的新版本
+    local tmp awk_status   # awk 输出的临时文件，以及 awk 的退出码
     [[ -f "$file" ]] || die "版本文件不存在: $file"
     if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
         die "变量名只能包含字母、数字和下划线: $key"
@@ -295,14 +339,16 @@ update_version_file() {
     replace_file_preserving_mode "$file" "$tmp"
 }
 
+# 统计公式文件中匹配正则的行数，结果写到 stdout。
 count_formula_lines() {
-    local file="$1"
-    local pattern="$2"
+    local file="$1"      # 公式文件
+    local pattern="$2"   # awk 正则
     awk -v pattern="$pattern" 'BEGIN { n = 0 } $0 ~ pattern { n++ } END { print n }' "$file"
 }
 
+# 统计与顶层 url 同缩进的 version 行数量。resource 块里更深缩进的 version 不算。
 count_toplevel_version_lines() {
-    local file="$1"
+    local file="$1"   # 公式文件
     awk '
         BEGIN { n = 0; indent = "" }
         $0 ~ /^[[:space:]]*url[[:space:]]+"/ && indent == "" {
@@ -323,10 +369,10 @@ count_toplevel_version_lines() {
     ' "$file"
 }
 
-# 读取 formula 里的版本。优先用与 url 同层的 version "X.Y.Z"；没有该行时从 url 的 tag 中取。
+# 读取公式里的版本并写到 stdout。优先用与 url 同层的 version "X.Y.Z"；没有该行时从 url 的 tag 中取。读不到时返回 1。
 read_formula_version() {
-    local file="$1"
-    local value count tag
+    local file="$1"          # 公式文件
+    local value count tag    # version 行里的版本、同层 version 行数、url 里的 tag
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
     count="$(count_toplevel_version_lines "$file")"
     if [[ "$count" -gt 1 ]]; then
@@ -386,13 +432,13 @@ read_formula_version() {
     printf '%s\n' "$tag"
 }
 
-# 把 url 写成具体 tag 地址。地址里已经包含版本时，删掉多余的 version 行。
+# 改写公式的顶层 url，并在传入 hash 时改写 sha256。url 已含版本时删掉同缩进的 version 行。
 rewrite_formula_fields() {
-    local file="$1"
-    local version="$2"
-    local url="$3"
-    local hash="$4"
-    local tmp awk_status
+    local file="$1"         # 公式文件
+    local version="$2"      # 仅在 url 仍含 #{version} 时用于替换
+    local url="$3"          # 新的具体 tag 地址；空字符串表示保留原 url 文本
+    local hash="$4"         # 新 sha256；空字符串表示不改 sha256
+    local tmp awk_status    # awk 输出的临时文件，以及 awk 的退出码
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
     tmp="$(mktemp)"
     awk -v url="$url" -v hash="$hash" -v ver="$version" '
@@ -451,11 +497,12 @@ rewrite_formula_fields() {
     replace_file_preserving_mode "$file" "$tmp"
 }
 
+# 发布打 tag 前调用：只更新公式 url，不改 sha256。同层 version 多于一行时失败。
 ensure_formula_version() {
-    local file="$1"
-    local version="$2"
-    local url="$3"
-    local count
+    local file="$1"      # 公式文件
+    local version="$2"   # 新版本，供旧式 #{version} 替换
+    local url="$3"       # 新的源码包地址
+    local count          # 与 url 同缩进的 version 行数
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
     count="$(count_toplevel_version_lines "$file")"
     if [[ "$count" -gt 1 ]]; then
@@ -464,13 +511,13 @@ ensure_formula_version() {
     rewrite_formula_fields "$file" "$version" "$url" ""
 }
 
-# 更新顶层 url 与 sha256。url 中已含版本时去掉多余的 version 行。
+# 更新顶层 url 与 sha256。url 中已含版本时去掉多余的 version 行。要求恰好一对顶层 url 与 sha256。
 update_formula_file() {
-    local file="$1"
-    local url="$2"
-    local hash="$3"
-    local version="$4"
-    local url_count sha_count
+    local file="$1"             # 公式文件
+    local url="$2"              # 新的源码包地址
+    local hash="$3"             # 新的 sha256
+    local version="$4"          # 新版本，供旧式 #{version} 替换
+    local url_count sha_count   # 顶层 url 行数与 sha256 行数
     [[ -f "$file" ]] || die "formula 文件不存在: $file"
     url_count="$(count_formula_lines "$file" '^[[:space:]]*url[[:space:]]+"')"
     sha_count="$(count_formula_lines "$file" '^[[:space:]]*sha256[[:space:]]+"')"
@@ -480,17 +527,22 @@ update_formula_file() {
     rewrite_formula_fields "$file" "$version" "$url" "$hash"
 }
 
+# 判断文件头是否为 gzip 魔数 1f8b。是则返回 0。
 archive_is_gzip() {
-    local sig
-    sig="$(od -An -N2 -tx1 "$1" 2>/dev/null | tr -d '[:space:]')"
+    local file="$1"   # 待检查的下载文件
+    local sig         # 文件前两字节的十六进制
+    sig="$(od -An -N2 -tx1 "$file" 2>/dev/null | tr -d '[:space:]')"
     [[ "$sig" == "1f8b" ]]
 }
 
-# GitHub 在 tag 推送后可能短暂不可下载，因此有限次重试。
+# 下载 tag 对应的 GitHub 源码包并计算 sha256，结果写到 stdout。tag 刚推送时可能短暂不可下载，因此有限次重试。
 compute_archive_sha256() {
-    local tag="$1"
-    local url="$2"
+    local tag="$1"   # 已推送的 tag，只用于临时文件名
+    local url="$2"   # 源码包地址
     local tmp_dir tmp_archive attempt max_attempts sleep_secs hash size
+    # tmp_dir / tmp_archive: 下载用的临时目录和文件
+    # attempt / max_attempts / sleep_secs: 当前次数、上限、下次等待秒数
+    # hash / size: 算出的 sha256，以及下载文件的字节数
     max_attempts="$GITHUB_RETRY_ATTEMPTS"
     sleep_secs="$GITHUB_RETRY_INITIAL_DELAY"
     tmp_dir="$(mktemp -d)"
@@ -529,9 +581,10 @@ compute_archive_sha256() {
     printf '%s\n' "$hash"
 }
 
+# 向 stderr 询问是否继续。--yes 或回答 y/Y 时返回 0，否则返回 1。非交互终端且没有 --yes 时失败。
 confirm() {
-    local prompt="$1"
-    local reply
+    local prompt="$1"   # 问题文本，不含 [y/N]
+    local reply         # 用户输入
     if [[ "$ASSUME_YES" -eq 1 ]]; then
         return 0
     fi
@@ -545,6 +598,7 @@ confirm() {
     [[ "$reply" == "y" || "$reply" == "Y" ]]
 }
 
+# dry-run 时只打印将执行的命令；否则原样执行。参数是命令及其参数。
 run_cmd() {
     if [[ "$DRY_RUN" -eq 1 ]]; then
         printf '[dry-run]'
@@ -555,19 +609,22 @@ run_cmd() {
     "$@"
 }
 
-# 权限、拒绝推送等结果重试也不会成功。
+# 判断 GitHub 相关错误是否不值得重试。权限不足、认证失败、推送被拒绝时返回 0。
 github_failure_is_permanent() {
-    local message="$1"
-    local pattern
+    local message="$1"   # 命令的标准错误
+    local pattern        # 永久性失败的匹配表达式
     pattern='no upstream branch|Authentication failed|Permission denied|Repository not found|\[rejected\]|failed to push some refs|password authentication was removed|Invalid username or password|could not read Username|hook declined'
     [[ "$message" =~ $pattern ]]
 }
 
-# 执行一条连接 GitHub 的命令。成功时把标准输出交还给调用方；标准错误原样显示。
+# 执行一条连接 GitHub 的命令。成功时把标准输出交还给调用方，标准错误原样显示。临时失败会重试。
 retry_github() {
-    local description="$1"
+    local description="$1"   # 日志里的动作名称
     shift
     local attempt max_attempts sleep_secs output errfile message
+    # attempt / max_attempts / sleep_secs: 当前次数、上限、下次等待秒数
+    # output: 命令的标准输出
+    # errfile / message: 暂存标准错误的文件，以及读出的错误文本
     max_attempts="$GITHUB_RETRY_ATTEMPTS"
     sleep_secs="$GITHUB_RETRY_INITIAL_DELAY"
     errfile="$(mktemp)"
@@ -604,9 +661,10 @@ retry_github() {
     return 1
 }
 
+# 把一个引用推到 origin。dry-run 只打印命令。失败时用 fail_message 退出。
 git_push_origin_ref() {
-    local ref="$1"
-    local fail_message="$2"
+    local ref="$1"            # HEAD 或 tag 名
+    local fail_message="$2"   # 推送失败时的错误说明
     if [[ "$DRY_RUN" -eq 1 ]]; then
         run_cmd git push origin "$ref"
         return 0
@@ -616,18 +674,21 @@ git_push_origin_ref() {
     fi
 }
 
+# 推送当前分支到 origin。
 git_push_origin_head() {
     git_push_origin_ref HEAD "推送项目仓库失败。请确认 origin 有权限，且当前分支可以推送"
 }
 
+# 推送一个 tag 到 origin。
 git_push_origin_tag() {
-    local tag="$1"
+    local tag="$1"   # 要推送的 tag 名
     git_push_origin_ref "$tag" "推送 tag ${tag} 失败。请确认 origin 有权限"
 }
 
+# 确认 curl、ruby、brew，以及 shasum 或 sha256sum 已安装。缺任何一个就退出。
 require_tools() {
-    local -a missing
-    local cmd
+    local -a missing   # 尚未找到的命令名
+    local cmd          # 正在检查的命令名
     missing=()
     for cmd in curl ruby brew; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -642,8 +703,9 @@ require_tools() {
     fi
 }
 
+# 确认当前目录是 git 仓库根目录，且不在 rebase、merge 或 detached HEAD。结果写入 PROJECT_ROOT。
 require_git_root() {
-    local top cwd
+    local top cwd   # 仓库根目录与当前目录的绝对路径
     if ! command -v git >/dev/null 2>&1; then
         die "未安装 git，无法确认当前目录是 git 仓库根目录"
     fi
@@ -667,6 +729,7 @@ require_git_root() {
     fi
 }
 
+# 全量发布前要求工作区没有未提交变更。有变更时打印 git status 并退出。
 assert_clean_worktree() {
     if [[ -n "$(git status --porcelain)" ]]; then
         die "项目工作区不干净。请先提交或清理变更后再发布。
@@ -675,9 +738,9 @@ $(git status --short)"
     fi
 }
 
-# 续跑只允许 formula 和本命令脚本有改动，避免把无关文件提交进发布。
+# 续跑只允许公式文件和本命令脚本有改动，避免把无关文件带进后续提交。
 assert_resume_worktree() {
-    local line path
+    local line path   # git status 的一行，以及其中的路径
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         path="${line:3}"
@@ -690,23 +753,26 @@ assert_resume_worktree() {
     done < <(git status --porcelain)
 }
 
+# 本地还没有这个 tag 时返回。已存在则退出。
 assert_tag_available() {
-    local tag="$1"
+    local tag="$1"   # 准备创建的 tag
     if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
         die "tag 已存在: ${tag}"
     fi
 }
 
+# 续跑要求本地已经有这个 tag。
 assert_local_tag() {
-    local tag="$1"
+    local tag="$1"   # --resume 对应的 tag
     if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
         die "续跑失败：本地不存在 tag ${tag}"
     fi
 }
 
+# 续跑要求 origin 上已经有这个 tag。查询失败或远端没有时退出。
 assert_remote_tag() {
-    local tag="$1"
-    local found
+    local tag="$1"   # --resume 对应的 tag
+    local found      # git ls-remote 的输出，空表示远端没有该 tag
     if ! found="$(retry_github "查询 origin 上的 tag ${tag}" git ls-remote --tags origin "refs/tags/${tag}")"; then
         die "无法查询 origin 上的 tag ${tag}"
     fi
@@ -715,6 +781,7 @@ assert_remote_tag() {
     fi
 }
 
+# 决定要读取的配置文件。优先 --config，其次 .formula/brew-publish.conf，再次 .brew-publish.conf。都没有时输出空行。
 resolve_config_path() {
     if [[ -n "$CLI_CONFIG" ]]; then
         [[ -f "$CLI_CONFIG" ]] || die "配置文件不存在: $CLI_CONFIG"
@@ -732,7 +799,7 @@ resolve_config_path() {
     printf '\n'
 }
 
-# 配置文件是发布所必需的。找不到时立即停止，避免后面才报缺少 tap。
+# 发布必须有配置文件。找不到时立即停止，并把路径写入 CONFIG_PATH。
 require_config_file() {
     CONFIG_PATH="$(resolve_config_path)"
     if [[ -z "$CONFIG_PATH" ]]; then
@@ -741,9 +808,9 @@ require_config_file() {
     fi
 }
 
-# formula= 只写文件名。实际文件在 .formula/ 下。
+# formula= 只接受文件名，结果写到 stdout。实际文件位于 .formula/ 下，不能带目录。
 formula_basename() {
-    local name="$1"
+    local name="$1"   # 配置或命令行给出的文件名
     name="$(trim "$name")"
     name="${name#./}"
     if [[ -z "$name" || "$name" == */* ]]; then
@@ -755,10 +822,11 @@ formula_basename() {
     printf '%s\n' "$name"
 }
 
+# 定位项目内的公式文件，结果写到 stdout。指定了文件名就用该文件；否则 .formula/ 下必须恰好有一个 .rb。
 resolve_formula_file() {
-    local explicit="$1"
-    local -a found
-    local path name
+    local explicit="$1"   # 配置或 --formula 给出的文件名，可为空
+    local -a found        # .formula 下扫到的 .rb
+    local path name       # 扫描到的路径，以及规范化后的文件名
     found=()
     if [[ -n "$explicit" ]]; then
         name="$(formula_basename "$explicit")"
@@ -783,24 +851,26 @@ resolve_formula_file() {
 $(printf '  %s\n' "${found[@]}")"
 }
 
-# 当前项目根目录有 brew-publish-formula 时，直接对该文件做 shellcheck。
+# 当前项目根目录有 brew-publish-formula 时，把该文件名写到 stdout，供 shellcheck 使用。
 builtin_shellcheck_target() {
     if [[ -f brew-publish-formula ]]; then
         printf '%s\n' "brew-publish-formula"
     fi
 }
 
+# 对本仓库的主脚本运行 shellcheck。未安装时退出，并提示可用 --skip-check。
 run_builtin_shellcheck() {
-    local target="$1"
+    local target="$1"   # 要检查的脚本路径
     if ! command -v shellcheck >/dev/null 2>&1; then
         die "缺少 shellcheck，请先安装 shellcheck。也可使用 --skip-check"
     fi
     shellcheck "$target"
 }
 
+# 取最新的语义化 tag，去掉前缀后把 X.Y.Z 写到 stdout。没有符合的 tag 时返回 1。
 latest_semver_tag() {
-    local tag version
-    local pattern
+    local tag version   # 原始 tag，以及去掉前缀后的版本
+    local pattern       # git tag -l 的匹配模式
     if [[ -n "$TAG_PREFIX" ]]; then
         pattern="${TAG_PREFIX}*"
     else
@@ -822,10 +892,9 @@ latest_semver_tag() {
     return 1
 }
 
-# 直接写 CURRENT_VERSION / HAS_RELEASE_TAG。
-# 不能放进 $(...)：命令替换在子进程里赋值，调用方看不到标记。
+# 写入 CURRENT_VERSION 与 HAS_RELEASE_TAG。不能放进 $(...)：命令替换在子进程里赋值，调用方看不到这两个变量。
 detect_current_version() {
-    local version
+    local version   # 从 tag 或公式 url 读到的 X.Y.Z
     HAS_RELEASE_TAG=0
     if version="$(latest_semver_tag)"; then
         HAS_RELEASE_TAG=1
@@ -841,8 +910,9 @@ detect_current_version() {
     CURRENT_VERSION="0.0.0"
 }
 
+# 查找本地 Tap 目录并写到 stdout。不存在时说明如何 brew tap-new 或 brew tap，然后退出。
 resolve_tap_repo() {
-    local tap_path=""
+    local tap_path=""   # brew --repo 返回的 Tap 目录
     if ! tap_path="$(find_local_tap)"; then
         die "本地还没有 Tap「${TAP_FULL}」。请先创建后再发布：
   brew tap-new ${TAP_FULL}
@@ -858,7 +928,7 @@ resolve_tap_repo() {
 
 # 打印本地 Tap 目录。不存在时返回 1，不打印内容。
 find_local_tap() {
-    local tap_path=""
+    local tap_path=""   # brew --repo 返回的 Tap 目录
     if ! command -v brew >/dev/null 2>&1; then
         die "未找到 brew 命令"
     fi
@@ -873,9 +943,9 @@ find_local_tap() {
     return 1
 }
 
-# --init 使用。Tap 不存在时询问是否 brew tap-new。
+# --init 使用。Tap 已存在时打印其目录；不存在时询问是否执行 brew tap-new。用户拒绝时返回 1。
 ensure_local_tap() {
-    local tap_path=""
+    local tap_path=""   # 找到或新建后的 Tap 目录
     if tap_path="$(find_local_tap)"; then
         log "已找到本地 Tap: ${tap_path}"
         printf '%s\n' "$tap_path"
@@ -897,11 +967,11 @@ ensure_local_tap() {
     printf '%s\n' "$tap_path"
 }
 
-# 在 Tap 中查找已有的 formula 文件。找不到时返回 1。
+# 在 Tap 中查找已有的公式文件，找到则把路径写到 stdout。找不到时返回 1。
 find_tap_formula_file() {
-    local tap_path="$1"
-    local name="$2"
-    local letter flat nested found
+    local tap_path="$1"                 # 本地 Tap 目录
+    local name="$2"                     # 公式名，不含 .rb
+    local letter flat nested found      # 首字母、扁平路径、按字母分子目录的路径、搜索到的文件
     letter="$(printf '%s' "${name:0:1}" | tr '[:upper:]' '[:lower:]')"
     flat="${tap_path}/Formula/${name}.rb"
     nested="${tap_path}/Formula/${letter}/${name}.rb"
@@ -923,11 +993,14 @@ find_tap_formula_file() {
     return 1
 }
 
-# 已有 formula 保持原路径。新 formula 跟随 Tap 里已经使用的目录布局。
+# 决定公式复制到 Tap 的路径。已有文件保持原路径；新文件跟随 Tap 里已经使用的目录布局。
 tap_formula_dest() {
-    local tap_path="$1"
-    local name="$2"
+    local tap_path="$1"            # 本地 Tap 目录
+    local name="$2"                # 公式名，不含 .rb
     local letter flat nested existing
+    # letter: 公式名首字母，用于 Formula/<letter>/
+    # flat / nested: 扁平路径与按字母分目录的路径
+    # existing: Tap 中已经出现的嵌套公式，用来判断该 Tap 的布局
     letter="${name:0:1}"
     flat="${tap_path}/Formula/${name}.rb"
     nested="${tap_path}/Formula/${letter}/${name}.rb"
@@ -947,8 +1020,9 @@ tap_formula_dest() {
     printf '%s\n' "$flat"
 }
 
+# 暂存区有变更时按给定说明提交。没有变更时只警告。dry-run 只打印 commit 命令。
 commit_if_staged() {
-    local message="$1"
+    local message="$1"   # git commit 的说明
     if [[ "$DRY_RUN" -eq 1 ]]; then
         run_cmd git commit -m "$message"
         return 0
@@ -960,6 +1034,7 @@ commit_if_staged() {
     git commit -m "$message"
 }
 
+# 解析命令行参数，写入 BUMP_TYPE、EXPLICIT_VERSION 和各个开关。参数是原始命令行参数。
 parse_args() {
     BUMP_TYPE=""
     EXPLICIT_VERSION=""
@@ -1067,8 +1142,12 @@ parse_args() {
     fi
 }
 
+# 合并配置与命令行，写入 Tap、公式路径、公式名和 tag 前缀。
 apply_project_settings() {
     local config_path tap_value formula_value
+    # config_path: 配置文件路径
+    # tap_value: 命令行优先的 tap
+    # formula_value: 命令行优先的公式文件名，可为空
     config_path="$CONFIG_PATH"
     CFG_TAP=""
     CFG_FORMULA=""
@@ -1102,8 +1181,12 @@ apply_project_settings() {
     esac
 }
 
+# 从 origin 解析 GitHub 仓库，写入 GITHUB_OWNER 与 GITHUB_REPO。
 load_github_origin() {
     local remote_url parsed owner repo
+    # remote_url: origin 的地址
+    # parsed: owner 与 repo 两行文本
+    # owner / repo: 拆开后的仓库所有者和仓库名
     if ! remote_url="$(git remote get-url origin 2>/dev/null)"; then
         die "未配置 origin。请把 origin 指向要发布的 GitHub 仓库"
     fi
@@ -1119,8 +1202,13 @@ load_github_origin() {
     GITHUB_REPO="$repo"
 }
 
+# 向 stdout 打印本次发布计划，供确认前查看。
 print_plan() {
     local mode_label bump_label check_label version_source
+    # mode_label: full 或 resume
+    # bump_label: patch、minor、major，或 explicit
+    # check_label: shellcheck 目标、skip 或 none
+    # version_source: 当前版本来自 git tag 还是公式 url
     if [[ "$RESUME_MODE" -eq 1 ]]; then
         mode_label="resume"
     else
@@ -1163,9 +1251,10 @@ print_plan() {
 EOF
 }
 
+# 把新版本的 url 与 sha256 写入本地公式。dry-run 只打印将写入的哈希。
 sync_formula_contents() {
-    local version="$1"
-    local hash="$2"
+    local version="$1"   # 新版本 X.Y.Z
+    local hash="$2"      # 源码包 sha256
     if [[ "$DRY_RUN" -eq 1 ]]; then
         printf '[dry-run] 更新 %s 的 url 与 sha256 → %s\n' "$FORMULA_FILE" "$hash"
         return 0
@@ -1173,11 +1262,11 @@ sync_formula_contents() {
     update_formula_file "$FORMULA_FILE" "$ARCHIVE_URL" "$hash" "$version"
 }
 
-# Homebrew 类名：brew-publish-formula → BrewPublishFormula。
+# 把公式文件名转成 Homebrew 类名，例如 brew-publish-formula → BrewPublishFormula。结果写到 stdout。
 formula_class_name() {
-    local name="$1"
-    local result="" cap_next=1 i c next
-    local len=${#name}
+    local name="$1"                      # 公式名，不含 .rb
+    local result="" cap_next=1 i c next  # 累积的类名、下个字符是否大写、下标、当前字符、下一个字符
+    local len=${#name}                   # 公式名长度
     for ((i = 0; i < len; i++)); do
         c="${name:i:1}"
         next="${name:i+1:1}"
@@ -1204,8 +1293,9 @@ formula_class_name() {
     printf '%s\n' "$result"
 }
 
+# 扫描 .formula 目录下的 .rb，结果写入 FORMULA_RB_FILES。目录不存在时得到空数组。
 list_formula_rb() {
-    local path
+    local path   # 扫描到的一个 .rb 路径
     FORMULA_RB_FILES=()
     if [[ ! -d .formula ]]; then
         return 0
@@ -1216,7 +1306,7 @@ list_formula_rb() {
     done < <(find .formula -maxdepth 1 -name '*.rb' -print | sort)
 }
 
-# 已有配置返回其路径。没有配置时返回将要创建的 .formula/brew-publish.conf。
+# 已有配置时返回其路径。没有配置时返回将要创建的 .formula/brew-publish.conf。--config 给出的路径会先做相对路径校验。
 init_config_path() {
     if [[ -n "$CLI_CONFIG" ]]; then
         normalize_repo_path "$CLI_CONFIG" "config"
@@ -1233,11 +1323,12 @@ init_config_path() {
     printf '%s\n' ".formula/brew-publish.conf"
 }
 
+# 写入一份可安装的公式模板。sha256 是占位值，等第一次发布后替换。
 write_formula_template() {
-    local path="$1"
-    local formula_name="$2"
-    local class_name="$3"
-    local version="$4"
+    local path="$1"           # 要创建的 .rb 路径
+    local formula_name="$2"   # 公式名，也是 bin.install 的文件名
+    local class_name="$3"     # Homebrew 类名
+    local version="$4"        # 模板 url 里使用的版本
     mkdir -p "$(dirname "$path")"
     cat > "$path" <<EOF
 # 由 brew-publish-formula --init 生成。
@@ -1260,10 +1351,11 @@ end
 EOF
 }
 
+# 写入 .formula/brew-publish.conf，包含 tap、formula 文件名和 tag_prefix。
 write_publish_config() {
-    local path="$1"
-    local tap="$2"
-    local formula_rel="$3"
+    local path="$1"          # 配置文件路径
+    local tap="$2"           # 写入配置的 tap
+    local formula_rel="$3"   # 公式文件名，不含目录
     mkdir -p "$(dirname "$path")"
     cat > "$path" <<EOF
 # 由 brew-publish-formula --init 生成。发布前请按项目修改。
@@ -1273,13 +1365,13 @@ tag_prefix=v
 EOF
 }
 
-# 目标 .rb 不存在时：Tap 里有同名文件就复制，没有则询问是否生成模板。
+# 目标 .rb 不存在时：Tap 里有同名文件就复制过来，没有则询问是否生成模板。
 init_missing_formula() {
-    local dest="$1"
-    local formula_name="$2"
-    local class_name="$3"
-    local version="$4"
-    local tap_path="" source_rb=""
+    local dest="$1"            # 项目内要创建的公式路径
+    local formula_name="$2"    # 公式名
+    local class_name="$3"      # 模板使用的类名
+    local version="$4"         # 模板 url 使用的版本
+    local tap_path="" source_rb=""   # 本地 Tap 目录，以及 Tap 里已有的公式文件
     if tap_path="$(ensure_local_tap)"; then
         if source_rb="$(find_tap_formula_file "$tap_path" "$formula_name")"; then
             mkdir -p "$(dirname "$dest")"
@@ -1300,7 +1392,7 @@ init_missing_formula() {
 
 # 把 .formula 写入 .gitignore。文件不存在时创建。已有相同规则时不重复添加。
 ensure_formula_gitignored() {
-    local line trimmed
+    local line trimmed   # .gitignore 的一行，以及去掉首尾空白后的内容
     if [[ -f .gitignore ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             line="${line%$'\r'}"
@@ -1323,9 +1415,15 @@ ensure_formula_gitignored() {
     log "已创建 .gitignore，并忽略 .formula"
 }
 
-# 生成缺失的配置和 formula。已有文件不会覆盖。
+# 生成缺失的配置和公式。已有文件不会覆盖，并确保 .formula 被 gitignore。
 run_init() {
     local conf_path formula_file_name formula_name class_name version tap formula_dest
+    # conf_path: 将读取或创建的配置路径
+    # formula_file_name: 公式文件名，例如 name.rb
+    # formula_name / class_name: 公式名与对应的 Homebrew 类名
+    # version: 模板 url 使用的版本，有 tag 时取最新 tag，否则为 0.1.0
+    # tap: 写入新配置的 tap
+    # formula_dest: 项目内公式的完整相对路径
     ensure_formula_gitignored
     load_github_origin
     list_formula_rb
@@ -1392,6 +1490,7 @@ $(printf '  %s\n' "${FORMULA_RB_FILES[@]}")"
     fi
 }
 
+# 发布或初始化的入口。参数是命令行参数。
 main() {
     set -euo pipefail
     unset CDPATH
@@ -1558,7 +1657,7 @@ main() {
         fi
     fi
 
-    local title
+    local title   # 结束时打印的结果标题
     if [[ "$DRY_RUN" -eq 1 ]]; then
         title="预览完成，没有修改文件，也没有推送。"
     else
