@@ -84,7 +84,7 @@ tag_prefix=v
 
 | 键 | 含义 |
 | --- | --- |
-| `tap` | `user/homebrew-tap` 或 `user/tap`。发布前会检查本地是否已有该 Tap；没有则先执行 `brew tap-new user/homebrew-tap` |
+| `tap` | `user/homebrew-tap` 或 `user/tap`。`--init` 结束后以及发布前，都会检查本地 Tap 是否存在，且 `origin` 指向 `https://github.com/user/homebrew-tap`。`brew tap-new` 只创建本地仓库。还需要在 GitHub 创建空仓库，再在 Tap 目录执行 `git remote add origin` 和 `git push -u origin HEAD` |
 | `formula` | 文件名，例如 `brew-publish-formula.rb`。实际路径是 `.formula/` 加上这个文件名。省略时，`.formula/` 下只能有一个 `*.rb` |
 | `tag_prefix` | 可选，默认 `v`，生成 `v1.2.3` |
 

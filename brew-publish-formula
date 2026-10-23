@@ -12,7 +12,7 @@
 # Flow:
 #   1. Require the current directory to be the git root (except --help)
 #   2. Require .formula/brew-publish.conf (or .brew-publish.conf / --config)
-#   3. Require the configured Homebrew Tap to exist locally, or tell you to create it
+#   3. Require the configured Tap to exist locally, with origin pointing at its GitHub repository. Otherwise tell you to create and link it
 #   4. Resolve the GitHub repository from origin and locate .formula/*.rb
 #   5. Compute the new version from the latest git tag and the bump type, or use --version
 #   6. Run shellcheck on this script when publishing this repository (--skip-check skips it)
@@ -92,7 +92,7 @@
 # 完整流程：
 #   1. 确认当前目录是 git 仓库根目录（--help 除外）
 #   2. 确认项目中存在 .formula/brew-publish.conf（或 .brew-publish.conf / --config）
-#   3. 确认配置中的 Homebrew Tap 已在本地存在，否则提示先创建
+#   3. 确认配置中的 Tap 已在本地存在，且 origin 指向对应的 GitHub 仓库。否则提示先创建并关联
 #   4. 从 origin 解析 GitHub 仓库，定位 .formula/*.rb
 #   5. 根据最新 git tag + bump 类型计算新版本，或使用 --version
 #   6. 发布本仓库时对主文件运行 shellcheck（可用 --skip-check 跳过）
@@ -1096,6 +1096,73 @@ ensure_local_tap() {
     printf '%s\n' "$tap_path"
 }
 
+# 确认 Tap 已关联到 GitHub 上的 TAP_FULL，且当前分支有上游。否则提示用户先创建仓库并关联。
+ensure_tap_github_remote() {
+    local tap_path="$1"          # 本地 Tap 目录；为空表示本地还没有这个 Tap
+    local url=""                  # origin 地址
+    local parsed="" owner="" repo=""  # 从 origin 解析出的 owner 与 repo
+    local expected_url=""         # 期望的 GitHub 地址
+    local upstream=""             # 当前分支的上游，例如 origin/main
+    local safe_url=""             # 去掉地址中用户信息后的 origin，用于提示
+    expected_url="https://github.com/${TAP_FULL}.git"
+    if [[ -z "$tap_path" || ! -d "$tap_path" ]]; then
+        die "$(t "Local Tap ${TAP_FULL} does not exist. Create an empty GitHub repository, then create and link the local Tap:
+
+  Create https://github.com/${TAP_FULL}
+  brew tap-new ${TAP_FULL}
+  cd \"\$(brew --repo ${TAP_FULL})\"
+  git remote add origin ${expected_url}
+  git push -u origin HEAD" "本地还没有 Tap「${TAP_FULL}」。请先在 GitHub 创建空仓库，再创建并关联本地 Tap：
+
+  创建 https://github.com/${TAP_FULL}
+  brew tap-new ${TAP_FULL}
+  cd \"\$(brew --repo ${TAP_FULL})\"
+  git remote add origin ${expected_url}
+  git push -u origin HEAD")"
+    fi
+    if ! url="$(git -C "$tap_path" remote get-url origin 2>/dev/null)"; then
+        die "$(t "Tap ${TAP_FULL} is not linked to GitHub. Create an empty repository and link it:
+
+  Create https://github.com/${TAP_FULL}
+  cd ${tap_path}
+  git remote add origin ${expected_url}
+  git push -u origin HEAD" "Tap「${TAP_FULL}」尚未关联 GitHub。请先创建空仓库并关联：
+
+  创建 https://github.com/${TAP_FULL}
+  cd ${tap_path}
+  git remote add origin ${expected_url}
+  git push -u origin HEAD")"
+    fi
+    safe_url="$(printf '%s\n' "$url" | sed -E 's#://[^/@]+@#://#')"
+    if ! parsed="$(parse_github_remote "$url")"; then
+        die "$(t "Tap origin is not a GitHub repository: ${safe_url}
+Expected: ${expected_url}" "Tap 的 origin 不是 GitHub 仓库: ${safe_url}
+期望: ${expected_url}")"
+    fi
+    owner="$(printf '%s\n' "$parsed" | sed -n '1p')"
+    repo="$(printf '%s\n' "$parsed" | sed -n '2p')"
+    if [[ "${owner}/${repo}" != "$TAP_FULL" ]]; then
+        die "$(t "Tap origin points at ${owner}/${repo}. Point it at ${TAP_FULL}:
+  cd ${tap_path}
+  git remote set-url origin ${expected_url}
+  git push -u origin HEAD" "Tap 的 origin 指向 ${owner}/${repo}，需要改为 ${TAP_FULL}：
+  cd ${tap_path}
+  git remote set-url origin ${expected_url}
+  git push -u origin HEAD")"
+    fi
+    if ! retry_github "$(t "Check GitHub repository ${TAP_FULL}" "检查 GitHub 仓库 ${TAP_FULL}")" git ls-remote "$url" HEAD >/dev/null; then
+        die "$(t "Cannot access ${expected_url}. Create that GitHub repository if it does not exist, and confirm this machine can access it." "无法访问 ${expected_url}。如果仓库还不存在，请先创建，并确认本机可以访问。")"
+    fi
+    if ! upstream="$(git -C "$tap_path" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)"; then
+        die "$(t "Tap origin is ${expected_url}, but the current branch has no upstream. Push it once:
+  cd ${tap_path}
+  git push -u origin HEAD" "Tap 的 origin 已是 ${expected_url}，但当前分支没有上游。请先推送一次：
+  cd ${tap_path}
+  git push -u origin HEAD")"
+    fi
+    log "$(t "Tap is linked to GitHub: ${TAP_FULL} (${upstream})" "Tap 已关联 GitHub: ${TAP_FULL}（${upstream}）")"
+}
+
 # 在 Tap 中查找已有的公式文件，找到则把路径写到 stdout。找不到时返回 1。
 find_tap_formula_file() {
     local tap_path="$1"                 # 本地 Tap 目录
@@ -1584,8 +1651,9 @@ ensure_formula_gitignored() {
 
 # 生成缺失的配置和公式。已有文件不会覆盖，并确保 .formula 被 gitignore。
 run_init() {
-    local conf_path formula_file_name formula_name class_name version tap formula_dest
+    local conf_path formula_file_name formula_name class_name version tap formula_dest tap_path
     # conf_path: 将读取或创建的配置路径
+    # tap_path: 本地 Tap 目录，用于检查 GitHub 关联
     # formula_file_name: 公式文件名，例如 name.rb
     # formula_name / class_name: 公式名与对应的 Homebrew 类名
     # version: 模板 url 使用的版本，有 tag 时取最新 tag，否则为 0.1.0
@@ -1656,6 +1724,11 @@ $(printf '  %s\n' "${FORMULA_RB_FILES[@]}")")"
     else
         init_missing_formula "$formula_dest" "$formula_name" "$class_name" "$version"
     fi
+    if tap_path="$(find_local_tap)"; then
+        ensure_tap_github_remote "$tap_path"
+    else
+        ensure_tap_github_remote ""
+    fi
 }
 
 # 发布或初始化的入口。参数是命令行参数。
@@ -1673,6 +1746,7 @@ main() {
     require_tools
     apply_project_settings
     TAP_PATH="$(resolve_tap_repo)"
+    ensure_tap_github_remote "$TAP_PATH"
     load_github_origin
 
     detect_current_version

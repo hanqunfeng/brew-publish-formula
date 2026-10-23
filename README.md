@@ -84,7 +84,7 @@ tag_prefix=v
 
 | Key | Meaning |
 | --- | --- |
-| `tap` | `user/homebrew-tap` or `user/tap`. Before publishing, the command checks that this Tap exists locally. If it does not, create it with `brew tap-new user/homebrew-tap` |
+| `tap` | `user/homebrew-tap` or `user/tap`. Before publishing, and again after `--init`, the command checks that this Tap exists locally and that its `origin` points at `https://github.com/user/homebrew-tap`. `brew tap-new` only creates the local repository. Create the empty GitHub repository, then `git remote add origin` and `git push -u origin HEAD` in the Tap directory |
 | `formula` | A filename such as `brew-publish-formula.rb`. The path is `.formula/` plus that name. When omitted, `.formula/` must contain exactly one `*.rb` |
 | `tag_prefix` | Optional. Defaults to `v`, producing `v1.2.3` |
 
