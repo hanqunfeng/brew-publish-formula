@@ -54,7 +54,7 @@ brew install hanqunfeng/tap/brew-publish-formula
 brew update && brew upgrade brew-publish-formula
 ```
 
-`.formula/brew-publish-formula.rb` 里的 `sha256` 在第一次成功发布前是占位值。发布命令会在 tag 推送后写成真实哈希。安装方式、Tap 初始化和手工步骤见 [`.formula/README.md`](.formula/README.md)。
+`.formula/*.rb` 里的 `sha256` 在第一次成功发布前可以是占位值。发布命令会在 tag 推送后写成真实哈希，再把这份文件复制到 Tap 并提交。`.formula` 不会进入项目仓库。
 
 ## 项目配置
 
@@ -119,9 +119,9 @@ brew-publish-formula --resume 1.0.6 --yes
 | `--resume X.Y.Z` | tag 已经推送时，从下载源码包继续 |
 | `--tap` `--formula` `--tag-prefix` `--config` | 覆盖配置文件中的对应项 |
 
-全量发布要求工作区干净。`--resume` 时只允许 `.formula` 里的公式已修改；发布本仓库时还允许 `brew-publish-formula` 已修改。
+全量发布要求工作区干净。`.formula` 被忽略时，其中的修改不会出现在 `git status` 里。`--resume` 时，若公式文件仍被跟踪，只允许它和 `brew-publish-formula` 已修改。
 
-正确的 `sha256` 只能在 tag 到达 GitHub 之后得到，所以 formula 的最终提交在 tag 之后。Homebrew 读取 Tap 里的 formula。
+正确的 `sha256` 只能在 tag 到达 GitHub 之后得到。脚本把它写入本地 `.formula`，再复制到 Tap。提交发生在 Tap 仓库，不发生在项目仓库。Homebrew 读取 Tap 里的 formula。
 
 tag 已推送但后续失败时，用 `--resume` 继续，不要再次 bump。
 

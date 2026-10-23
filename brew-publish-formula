@@ -15,11 +15,11 @@
 #   4. 从 origin 解析 GitHub 仓库，定位 .formula/*.rb
 #   5. 根据最新 git tag + bump 类型计算新版本，或使用 --version
 #   6. 发布本仓库时对主文件运行 shellcheck（可用 --skip-check 跳过）
-#   7. 更新 formula 的 url，提交并推送，创建 annotated tag（如 v1.0.6）
+#   7. 更新本地 formula 的 url。发布本仓库时更新 TOOL_VERSION 并提交，然后创建 annotated tag（如 v1.0.6）
 #   8. 下载该 tag 的 GitHub 源码包并计算 sha256
-#   9. 更新 formula 的 url / sha256，提交并推送项目仓库
+#   9. 更新本地 formula 的 url / sha256，不提交到项目仓库
 #  10. 将 formula 复制到本地 Tap，执行 brew style / brew audit
-#  11. 若 style 改写了 formula，回同步到项目仓库
+#  11. 若 style 改写了 formula，回写到本地 .formula
 #  12. 提交并推送 Tap
 #
 # 用法:
@@ -68,9 +68,9 @@
 #   - 已安装 git、curl、ruby、brew，以及 shasum 或 sha256sum
 #
 # 说明:
-#   tag 对应的源码包哈希要等 tag 推上 GitHub 才能计算，因此 formula 的
-#   sha256 提交落在 tag 之后。Homebrew 安装使用 Tap 仓库里的 formula。
-#   项目仓库中的 .formula/ 是同步源。
+#   tag 对应的源码包哈希要等 tag 推上 GitHub 才能计算。算完后写入本地
+#   .formula，再复制到 Tap 并在 Tap 仓库提交。Homebrew 安装使用 Tap 里的 formula。
+#   .formula 由 .gitignore 忽略，发布不会把它加入项目仓库。
 #   连接 GitHub 的 git push、git ls-remote 和源码包下载都会重试，最多 8 次，
 #   间隔从 3 秒起，每次失败增加 2 秒。权限不足、推送被拒绝这类错误不会重试。
 # =============================================================================
@@ -1429,6 +1429,9 @@ main() {
     TAP_FORMULA_PATH="$(tap_formula_dest "$TAP_PATH" "$FORMULA_NAME")"
     print_plan
     confirm "确认按上述计划发布？" || die "已取消"
+    if git ls-files --error-unmatch -- "$FORMULA_FILE" >/dev/null 2>&1; then
+        warn "${FORMULA_FILE} 仍被 git 跟踪。发布只更新本地文件和 Tap，不会把它提交进项目仓库"
+    fi
 
     if [[ "$RESUME_MODE" -eq 0 ]]; then
         if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -1452,7 +1455,6 @@ main() {
         log "更新 ${FORMULA_FILE} 的 url → ${ARCHIVE_URL}"
         if [[ "$DRY_RUN" -eq 0 ]]; then
             ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION" "$ARCHIVE_URL"
-            git add -f -- "$FORMULA_FILE"
             if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
                 update_version_file brew-publish-formula TOOL_VERSION "$NEW_VERSION"
                 git add -- brew-publish-formula
@@ -1460,12 +1462,11 @@ main() {
             commit_if_staged "chore: bump version to ${NEW_VERSION}"
         else
             printf '[dry-run] 更新 %s 的 url → %s\n' "$FORMULA_FILE" "$ARCHIVE_URL"
-            run_cmd git add -f -- "$FORMULA_FILE"
             if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
                 printf '[dry-run] 更新 brew-publish-formula 的 TOOL_VERSION → %s\n' "$NEW_VERSION"
                 run_cmd git add -- brew-publish-formula
+                run_cmd git commit -m "chore: bump version to ${NEW_VERSION}"
             fi
-            run_cmd git commit -m "chore: bump version to ${NEW_VERSION}"
         fi
 
         log "创建 tag ${NEW_TAG}"
@@ -1499,25 +1500,10 @@ main() {
         log "sha256 = ${NEW_SHA256}"
     fi
 
-    log "同步 ${FORMULA_FILE}"
+    log "更新本地 ${FORMULA_FILE} 的 url 与 sha256"
     sync_formula_contents "$NEW_VERSION" "$NEW_SHA256"
     log "检查 formula Ruby 语法"
     run_cmd ruby -c "$FORMULA_FILE"
-
-    log "提交项目仓库中的 formula 更新"
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-        git add -f -- "$FORMULA_FILE"
-        commit_if_staged "chore: update formula for ${NEW_TAG}"
-        if [[ "$PUSH_REMOTE" -eq 1 ]]; then
-            git_push_origin_head
-        fi
-    else
-        run_cmd git add -f -- "$FORMULA_FILE"
-        run_cmd git commit -m "chore: update formula for ${NEW_TAG}"
-        if [[ "$PUSH_REMOTE" -eq 1 ]]; then
-            run_cmd git push origin HEAD
-        fi
-    fi
 
     log "同步 formula 到 Tap: ${TAP_FORMULA_PATH}"
     if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -1543,13 +1529,8 @@ main() {
 
     if [[ "$DRY_RUN" -eq 0 && "$SKIP_TAP_AUDIT" -eq 0 ]]; then
         if ! cmp -s "$FORMULA_FILE" "$TAP_FORMULA_PATH"; then
-            log "brew style 修改了 formula，回同步到项目仓库"
+            log "brew style 修改了 formula，回写到 ${FORMULA_FILE}"
             cp "$TAP_FORMULA_PATH" "$FORMULA_FILE"
-            git add -f -- "$FORMULA_FILE"
-            commit_if_staged "chore: apply brew style fixes for ${NEW_TAG}"
-            if [[ "$PUSH_REMOTE" -eq 1 ]]; then
-                git_push_origin_head
-            fi
         fi
     fi
 
