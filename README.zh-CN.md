@@ -80,6 +80,8 @@ brew-publish-formula --init
 tap=hanqunfeng/homebrew-tap
 formula=brew-publish-formula.rb
 tag_prefix=v
+# version_file=scripts/app.sh
+# version_key=SCRIPT_VERSION
 ```
 
 | 键 | 含义 |
@@ -87,6 +89,8 @@ tag_prefix=v
 | `tap` | `user/homebrew-tap` 或 `user/tap`。`--init` 结束后以及发布前，都会检查本地 Tap 是否存在，且 `origin` 指向 `https://github.com/user/homebrew-tap`。`brew tap-new` 只创建本地仓库。还需要在 GitHub 创建空仓库，再在 Tap 目录执行 `git remote add origin` 和 `git push -u origin HEAD` |
 | `formula` | 文件名，例如 `brew-publish-formula.rb`。实际路径是 `.formula/` 加上这个文件名。省略时，`.formula/` 下只能有一个 `*.rb` |
 | `tag_prefix` | 可选，默认 `v`，生成 `v1.2.3` |
+| `version_file` | 可选。仓库内相对路径，必须与 `version_key` 一起配置。两者都不写时，版本来自最新的语义化 tag，其次是公式 `url`，最后是 `0.0.0` |
+| `version_key` | 可选。该文件中的变量名，写法是 `SCRIPT_VERSION="1.0.10"`。命令读取这个值，按 `patch` / `minor` / `major` 或 `--version` 计算后，在打 tag 前写回同一行 |
 
 `origin` 必须指向 GitHub。源码包地址和 tag 推送都使用这个远程：
 
@@ -97,6 +101,8 @@ https://github.com/<owner>/<repo>/archive/refs/tags/vX.Y.Z.tar.gz
 `url` 里直接写 tag，例如 `v1.2.3`。Homebrew 会从这段地址识别版本，所以公式里不再单独写 `version`。再写一行相同的 `version` 时，`brew audit` 会报 redundant。发布时会把 `url` 里的 tag 改成新版本，并更新 `sha256`。
 
 版本号优先取最新的语义化 tag。没有 tag 时从 formula 的 `url` 读取。都没有时按 `0.0.0` 递增。第一次打 tag 可以用 `--version` 指定版本，不必先有历史 tag。
+
+同时配置 `version_file` 和 `version_key` 后，当前版本改为从该文件读取。文件中需要有 `SCRIPT_VERSION="1.0.10"` 这样的赋值。发布时读取这个值，再把新版本写回同一行。新版本必须高于文件中的版本；仓库里已有语义化 tag 时，还必须高于最新 tag。两项都不写时，仍按 tag、公式 `url`、`0.0.0` 的顺序。未配置 `version_file` 时，发布本仓库仍会更新 `brew-publish-formula` 里的 `TOOL_VERSION`。
 
 ## 发布
 
@@ -123,7 +129,7 @@ brew-publish-formula --resume 1.0.6 --yes
 | `--resume X.Y.Z` | tag 已经推送时，从下载源码包继续 |
 | `--tap` `--formula` `--tag-prefix` `--config` | 覆盖配置文件中的对应项 |
 
-全量发布要求工作区干净。`.formula` 被忽略时，其中的修改不会出现在 `git status` 里。`--resume` 时，若公式文件仍被跟踪，只允许它和 `brew-publish-formula` 已修改。
+全量发布要求工作区干净。`.formula` 被忽略时，其中的修改不会出现在 `git status` 里。`--resume` 时，若公式文件仍被跟踪，只允许它、`brew-publish-formula` 和配置的 `version_file` 已修改。
 
 正确的 `sha256` 只能在 tag 到达 GitHub 之后得到。脚本把它写入本地 `.formula`，再复制到 Tap。提交发生在 Tap 仓库，不发生在项目仓库。Homebrew 读取 Tap 里的 formula。
 
@@ -150,6 +156,8 @@ brew install --build-from-source ./.formula/<formula-name>.rb
 tap=hanqunfeng/homebrew-tap
 formula=java-project-generator.rb
 tag_prefix=v
+# version_file=scripts/app.sh
+# version_key=SCRIPT_VERSION
 ```
 
 之后在该仓库根目录执行 `brew-publish-formula patch`。

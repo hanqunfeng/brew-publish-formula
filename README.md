@@ -80,6 +80,8 @@ When the target `.rb` does not exist yet:
 tap=hanqunfeng/homebrew-tap
 formula=brew-publish-formula.rb
 tag_prefix=v
+# version_file=scripts/app.sh
+# version_key=SCRIPT_VERSION
 ```
 
 | Key | Meaning |
@@ -87,6 +89,8 @@ tag_prefix=v
 | `tap` | `user/homebrew-tap` or `user/tap`. Before publishing, and again after `--init`, the command checks that this Tap exists locally and that its `origin` points at `https://github.com/user/homebrew-tap`. `brew tap-new` only creates the local repository. Create the empty GitHub repository, then `git remote add origin` and `git push -u origin HEAD` in the Tap directory |
 | `formula` | A filename such as `brew-publish-formula.rb`. The path is `.formula/` plus that name. When omitted, `.formula/` must contain exactly one `*.rb` |
 | `tag_prefix` | Optional. Defaults to `v`, producing `v1.2.3` |
+| `version_file` | Optional. A path inside the repository. Set it together with `version_key`. When both are omitted, the version comes from the latest semver tag, then the formula `url`, then `0.0.0` |
+| `version_key` | Optional. The variable in that file, written as `SCRIPT_VERSION="1.0.10"`. The command reads it, applies `patch` / `minor` / `major` or `--version`, and writes the new value back before the tag |
 
 `origin` must point at GitHub. The archive URL and the tag push both use that remote:
 
@@ -97,6 +101,8 @@ https://github.com/<owner>/<repo>/archive/refs/tags/vX.Y.Z.tar.gz
 Write the tag directly in `url`, for example `v1.2.3`. Homebrew reads the version from that URL, so the formula does not also declare `version`. A matching `version` line makes `brew audit` report it as redundant. A publish rewrites the tag in `url` and updates `sha256`.
 
 The version comes from the latest semver tag. With no tag, it is read from the formula `url`. With neither, the next version starts from `0.0.0`. The first tag can be set with `--version`; earlier tags are not required.
+
+`version_file` and `version_key` replace that source when both are set. The file must contain an assignment such as `SCRIPT_VERSION="1.0.10"`. A publish reads that value and writes the new version back to the same line. The new version must be greater than the value in the file, and greater than the latest semver tag when the repository already has one. Omit both keys to keep the tag, formula `url`, and `0.0.0` order. Publishing this repository still updates `TOOL_VERSION` in `brew-publish-formula` when `version_file` is not set.
 
 ## Publish
 
@@ -123,7 +129,7 @@ The command prints the release plan and waits for confirmation. `--yes` skips th
 | `--resume X.Y.Z` | Continue from the archive download when the tag is already pushed |
 | `--tap` `--formula` `--tag-prefix` `--config` | Override the matching config keys |
 
-A full publish requires a clean worktree. Changes under an ignored `.formula` do not appear in `git status`. On `--resume`, if the formula file is still tracked, only that file and `brew-publish-formula` may be modified.
+A full publish requires a clean worktree. Changes under an ignored `.formula` do not appear in `git status`. On `--resume`, if the formula file is still tracked, only that file, `brew-publish-formula`, and the configured `version_file` may be modified.
 
 The real `sha256` is available only after the tag reaches GitHub. The script writes it into the local `.formula` file, then copies that file into the Tap. The commit is made in the Tap repository, not in the project repository. Homebrew reads the formula from the Tap.
 
@@ -150,6 +156,8 @@ For `java-project-generator`, add `.formula/brew-publish.conf` to that repositor
 tap=hanqunfeng/homebrew-tap
 formula=java-project-generator.rb
 tag_prefix=v
+# version_file=scripts/app.sh
+# version_key=SCRIPT_VERSION
 ```
 
 Then run `brew-publish-formula patch` in that repository's root.

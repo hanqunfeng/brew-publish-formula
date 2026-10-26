@@ -14,9 +14,12 @@
 #   2. Require .formula/brew-publish.conf (or .brew-publish.conf / --config)
 #   3. Require the configured Tap to exist locally, with origin pointing at its GitHub repository. Otherwise tell you to create and link it
 #   4. Resolve the GitHub repository from origin and locate .formula/*.rb
-#   5. Compute the new version from the latest git tag and the bump type, or use --version
+#   5. Compute the new version from version_file when both version keys are set.
+#      Otherwise use the latest git tag and the bump type, or use --version
 #   6. Run shellcheck on this script when publishing this repository (--skip-check skips it)
-#   7. Update the local formula url. When publishing this repository, update TOOL_VERSION, commit it, and create an annotated tag (for example v1.0.6)
+#   7. Update the local formula url. Write the new version back to version_file when configured.
+#      Without version_file, publishing this repository updates TOOL_VERSION and commits it.
+#      Then create an annotated tag (for example v1.0.6)
 #   8. Download that tag's GitHub archive and compute sha256
 #   9. Update the local formula url / sha256 without committing it to the project
 #  10. Copy the formula into the local Tap and run brew style / brew audit
@@ -41,6 +44,9 @@
 #   tap=hanqunfeng/homebrew-tap
 #   formula=java-project-generator.rb
 #   tag_prefix=v
+#   version_file and version_key are optional and must be set together.
+#   They read KEY="X.Y.Z" from a project file and write the new version back.
+#   When omitted, the version comes from the latest git tag.
 #
 # Options:
 #   --config FILE       Config file path
@@ -94,9 +100,12 @@
 #   2. 确认项目中存在 .formula/brew-publish.conf（或 .brew-publish.conf / --config）
 #   3. 确认配置中的 Tap 已在本地存在，且 origin 指向对应的 GitHub 仓库。否则提示先创建并关联
 #   4. 从 origin 解析 GitHub 仓库，定位 .formula/*.rb
-#   5. 根据最新 git tag + bump 类型计算新版本，或使用 --version
+#   5. 配置了 version_file 与 version_key 时，从该文件计算新版本。
+#      否则根据最新 git tag + bump 类型计算，或使用 --version
 #   6. 发布本仓库时对主文件运行 shellcheck（可用 --skip-check 跳过）
-#   7. 更新本地 formula 的 url。发布本仓库时更新 TOOL_VERSION 并提交，然后创建 annotated tag（如 v1.0.6）
+#   7. 更新本地 formula 的 url。配置了 version_file 时把新版本写回该文件。
+#      未配置时，发布本仓库会更新 TOOL_VERSION 并提交。
+#      然后创建 annotated tag（如 v1.0.6）
 #   8. 下载该 tag 的 GitHub 源码包并计算 sha256
 #   9. 更新本地 formula 的 url / sha256，不提交到项目仓库
 #  10. 将 formula 复制到本地 Tap，执行 brew style / brew audit
@@ -121,6 +130,9 @@
 #   tap=hanqunfeng/homebrew-tap
 #   formula=java-project-generator.rb
 #   tag_prefix=v
+#   version_file 与 version_key 可选，必须同时配置。
+#   从项目文件中的 KEY="X.Y.Z" 读取版本，再写回新版本。
+#   不配置时，版本来自最新的 git tag。
 #
 # 选项:
 #   --config FILE       指定配置文件
@@ -172,6 +184,12 @@ GITHUB_RETRY_INITIAL_DELAY=3
 # CFG_FORMULA           配置文件中的 formula 文件名。
 # CFG_TAG_PREFIX        配置文件中的 tag 前缀。
 # CFG_HAS_TAG_PREFIX    配置是否写了 tag_prefix。1 表示写了，空字符串也算写了。
+# CFG_VERSION_FILE      配置文件中的 version_file。空表示未配置。
+# CFG_VERSION_KEY       配置文件中的 version_key。空表示未配置。
+# VERSION_FILE          解析后的版本文件相对路径。空表示沿用 tag 逻辑。
+# VERSION_KEY           版本文件中的变量名，例如 SCRIPT_VERSION。
+# VERSION_FROM_FILE     1 表示当前版本读自 VERSION_FILE。
+# LATEST_TAG_VERSION    最新语义化 tag 去掉前缀后的版本。没有 tag 时为空。
 # PROJECT_ROOT          当前项目的 git 根目录绝对路径。
 # CONFIG_PATH           实际读到的配置文件路径。
 # BUMP_TYPE             patch、minor 或 major。与显式版本互斥。
@@ -192,7 +210,7 @@ GITHUB_RETRY_INITIAL_DELAY=3
 # FORMULA_NAME          公式名，即文件名去掉 .rb。
 # TAG_PREFIX            最终使用的 tag 前缀，默认 v。
 # HAS_RELEASE_TAG       1 表示仓库里已有语义化 tag。
-# CURRENT_VERSION       当前版本，来自最新 tag、公式 url 或 0.0.0。
+# CURRENT_VERSION       当前版本。配置了版本文件时来自该文件，否则来自最新 tag、公式 url 或 0.0.0。
 # GITHUB_OWNER          origin 解析出的 GitHub 用户或组织。
 # GITHUB_REPO           origin 解析出的仓库名。
 # NEW_VERSION           本次要发布的 X.Y.Z。
@@ -377,6 +395,8 @@ load_config_file() {
     CFG_FORMULA=""
     CFG_TAG_PREFIX=""
     CFG_HAS_TAG_PREFIX=0
+    CFG_VERSION_FILE=""
+    CFG_VERSION_KEY=""
     [[ -f "$file" ]] || die "$(t "Config file not found: $file" "配置文件不存在: $file")"
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%$'\r'}"
@@ -398,6 +418,8 @@ load_config_file() {
                 CFG_TAG_PREFIX="$value"
                 CFG_HAS_TAG_PREFIX=1
                 ;;
+            version_file) CFG_VERSION_FILE="$value" ;;
+            version_key) CFG_VERSION_KEY="$value" ;;
             *) die "$(t "Unknown config key: $key" "未知配置项: $key")" ;;
         esac
     done < "$file"
@@ -862,7 +884,7 @@ $(git status --short)")"
     fi
 }
 
-# 续跑只允许公式文件和本命令脚本有改动，避免把无关文件带进后续提交。
+# 续跑只允许公式文件、本命令脚本，以及配置的 version_file 有改动，避免把无关文件带进后续提交。
 assert_resume_worktree() {
     local line path   # git status 的一行，以及其中的路径
     while IFS= read -r line; do
@@ -871,7 +893,7 @@ assert_resume_worktree() {
         case "$path" in
             *" -> "*) die "$(t "Resume does not support renames: $path" "续跑时不支持重命名变更: $path")" ;;
         esac
-        if [[ "$path" != "$FORMULA_FILE" && "$path" != "brew-publish-formula" ]]; then
+        if [[ "$path" != "$FORMULA_FILE" && "$path" != "brew-publish-formula" && "$path" != "${VERSION_FILE:-}" ]]; then
             die "$(t "Resume found an unrelated change: $path" "续跑时工作区含有无关变更: $path")"
         fi
     done < <(git status --porcelain)
@@ -1018,13 +1040,56 @@ latest_semver_tag() {
     return 1
 }
 
+# 从文件中的 KEY="X.Y.Z" 读取版本，结果写到 stdout。找不到时返回 1。
+read_version_from_file() {
+    local file="$1"        # 版本文件
+    local key="$2"         # 变量名，例如 SCRIPT_VERSION
+    local value=""         # 读到的 X.Y.Z
+    local awk_status=0     # awk 退出码。2 表示没有匹配的赋值
+    [[ -f "$file" ]] || return 1
+    value="$(awk -v key="$key" '
+        BEGIN { found = 0 }
+        {
+            pattern = "^[[:space:]]*" key "=\"[0-9]+\\.[0-9]+\\.[0-9]+\""
+            if (match($0, pattern)) {
+                line = substr($0, RSTART, RLENGTH)
+                if (match(line, /[0-9]+\.[0-9]+\.[0-9]+/)) {
+                    print substr(line, RSTART, RLENGTH)
+                    found = 1
+                    exit
+                }
+            }
+        }
+        END { if (found == 0) exit 2 }
+    ' "$file")" && awk_status=0 || awk_status=$?
+    if [[ "$awk_status" -ne 0 || -z "$value" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
 # 写入 CURRENT_VERSION 与 HAS_RELEASE_TAG。不能放进 $(...)：命令替换在子进程里赋值，调用方看不到这两个变量。
+# 配置了 version_file 与 version_key 时，当前版本从该文件读取；否则沿用 tag、公式 url、0.0.0。
 detect_current_version() {
-    local version   # 从 tag 或公式 url 读到的 X.Y.Z
+    local version   # 从 tag、版本文件或公式 url 读到的 X.Y.Z
     HAS_RELEASE_TAG=0
+    LATEST_TAG_VERSION=""
+    VERSION_FROM_FILE=0
     if version="$(latest_semver_tag)"; then
         HAS_RELEASE_TAG=1
+        LATEST_TAG_VERSION="$version"
+    fi
+    if [[ -n "${VERSION_FILE:-}" ]]; then
+        if ! version="$(read_version_from_file "$VERSION_FILE" "$VERSION_KEY")"; then
+            die "$(t "Cannot read ${VERSION_KEY}=\"X.Y.Z\" from ${VERSION_FILE}" "无法从 ${VERSION_FILE} 读取 ${VERSION_KEY}=\"X.Y.Z\"")"
+        fi
         CURRENT_VERSION="$version"
+        VERSION_FROM_FILE=1
+        log "$(t "Current version ${version} read from ${VERSION_FILE} ${VERSION_KEY}" "从 ${VERSION_FILE} 的 ${VERSION_KEY} 读到当前版本 ${version}")"
+        return 0
+    fi
+    if [[ "$HAS_RELEASE_TAG" -eq 1 ]]; then
+        CURRENT_VERSION="$LATEST_TAG_VERSION"
         return 0
     fi
     if version="$(read_formula_version "$FORMULA_FILE")"; then
@@ -1369,6 +1434,11 @@ apply_project_settings() {
     CFG_FORMULA=""
     CFG_TAG_PREFIX=""
     CFG_HAS_TAG_PREFIX=0
+    CFG_VERSION_FILE=""
+    CFG_VERSION_KEY=""
+    VERSION_FILE=""
+    VERSION_KEY=""
+    VERSION_FROM_FILE=0
     if [[ -n "$config_path" ]]; then
         log "$(t "Reading config: ${config_path}" "读取配置: ${config_path}")"
         load_config_file "$config_path"
@@ -1395,6 +1465,20 @@ apply_project_settings() {
     case "$TAG_PREFIX" in
         *[[:space:]/]*) die "$(t "tag_prefix cannot contain whitespace or a slash: $TAG_PREFIX" "tag_prefix 不能包含空白或斜杠: $TAG_PREFIX")" ;;
     esac
+
+    if [[ -n "$CFG_VERSION_FILE" || -n "$CFG_VERSION_KEY" ]]; then
+        if [[ -z "$CFG_VERSION_FILE" || -z "$CFG_VERSION_KEY" ]]; then
+            die "$(t "version_file and version_key must both be set, or both be omitted" "version_file 与 version_key 必须同时配置，或同时省略")"
+        fi
+        if [[ ! "$CFG_VERSION_KEY" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            die "$(t "version_key may contain only letters, digits, and underscores: $CFG_VERSION_KEY" "version_key 只能包含字母、数字和下划线: $CFG_VERSION_KEY")"
+        fi
+        VERSION_FILE="$(normalize_repo_path "$CFG_VERSION_FILE" "version_file")"
+        VERSION_KEY="$CFG_VERSION_KEY"
+        if [[ ! -f "$VERSION_FILE" ]]; then
+            die "$(t "version_file not found: $VERSION_FILE" "version_file 不存在: $VERSION_FILE")"
+        fi
+    fi
 }
 
 # 从 origin 解析 GitHub 仓库，写入 GITHUB_OWNER 与 GITHUB_REPO。
@@ -1424,14 +1508,16 @@ print_plan() {
     # mode_label: full 或 resume
     # bump_label: patch、minor、major，或 explicit
     # check_label: shellcheck 目标、skip 或 none
-    # version_source: 当前版本来自 git tag 还是公式 url
+    # version_source: 当前版本来自版本文件、git tag 或公式 url
     if [[ "$RESUME_MODE" -eq 1 ]]; then
         mode_label="resume"
     else
         mode_label="full"
     fi
     bump_label="${BUMP_TYPE:-explicit}"
-    if [[ "$HAS_RELEASE_TAG" -eq 1 ]]; then
+    if [[ "${VERSION_FROM_FILE:-0}" -eq 1 ]]; then
+        version_source="${VERSION_FILE} ${VERSION_KEY}"
+    elif [[ "$HAS_RELEASE_TAG" -eq 1 ]]; then
         version_source="git tag"
     else
         version_source="$(t "${FORMULA_FILE} url" "${FORMULA_FILE} 的 url")"
@@ -1583,20 +1669,64 @@ end
 EOF
 }
 
-# 写入 .formula/brew-publish.conf，包含 tap、formula 文件名和 tag_prefix。
+# 写入 .formula/brew-publish.conf。赋值上方说明全部配置项。version_file 与 version_key 只写在说明里，默认不启用。
 write_publish_config() {
     local path="$1"          # 配置文件路径
     local tap="$2"           # 写入配置的 tap
     local formula_rel="$3"   # 公式文件名，不含目录
-    local note_config   # 配置文件顶部的说明
+    local note_config note_tap note_formula note_prefix note_vfile note_vkey
+    # note_config: 文件来源。其余变量是各配置项的说明
     note_config="$(t "Generated by brew-publish-formula --init. Edit before publishing." "由 brew-publish-formula --init 生成。发布前请按项目修改。")"
+    note_tap="$(t "Required. user/homebrew-tap or user/tap." "必填。user/homebrew-tap 或 user/tap。")"
+    note_formula="$(t "Optional. Formula filename only. The file is .formula/<name>. When omitted, .formula/ must contain exactly one .rb." "可选。只写公式文件名，实际路径是 .formula/<文件名>。省略时 .formula/ 下只能有一个 .rb。")"
+    note_prefix="$(t "Optional. Tag prefix. Default v, so a tag looks like v1.2.3." "可选。tag 前缀，默认 v，生成 v1.2.3。")"
+    note_vfile="$(t "Optional. Path inside the repository. The file must contain KEY=\"X.Y.Z\". Set this together with version_key. When both are omitted, the version comes from the latest git tag, then the formula url, then 0.0.0." "可选。仓库内相对路径，文件中要有 KEY=\"X.Y.Z\"。必须与 version_key 一起配置。两者都不写时，版本来自最新 git tag，其次是公式 url，最后是 0.0.0。")"
+    note_vkey="$(t "Optional. Variable name in version_file, for example SCRIPT_VERSION=\"1.0.10\". The command reads it and writes the new version back." "可选。version_file 里的变量名，例如 SCRIPT_VERSION=\"1.0.10\"。发布时读取该值，再按本次命令写回新版本。")"
     mkdir -p "$(dirname "$path")"
     cat > "$path" <<EOF
 # ${note_config}
+#
+# tap
+#   ${note_tap}
+# formula
+#   ${note_formula}
+# tag_prefix
+#   ${note_prefix}
+# version_file
+#   ${note_vfile}
+# version_key
+#   ${note_vkey}
 tap=${tap}
 formula=${formula_rel}
 tag_prefix=v
 EOF
+}
+
+# 发布前把新版本写回项目文件并暂存。配置了 version_file 时改那个文件；否则发布本仓库时改 TOOL_VERSION。
+stage_declared_version() {
+    local target=""   # 要改写的文件。空表示本次没有版本变量需要提交
+    local key=""      # 该文件中的变量名
+    if [[ -n "${VERSION_FILE:-}" ]]; then
+        target="$VERSION_FILE"
+        key="$VERSION_KEY"
+    elif [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
+        target="brew-publish-formula"
+        key="TOOL_VERSION"
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        if [[ -n "$target" ]]; then
+            printf '%s\n' "$(t "[dry-run] update ${key} in ${target} → ${NEW_VERSION}" "[dry-run] 更新 ${target} 的 ${key} → ${NEW_VERSION}")"
+            run_cmd git add -- "$target"
+            run_cmd git commit -m "chore: bump version to ${NEW_VERSION}"
+        fi
+        return 0
+    fi
+    if [[ -n "$target" ]]; then
+        log "$(t "Updating ${key} in ${target} → ${NEW_VERSION}" "更新 ${target} 的 ${key} → ${NEW_VERSION}")"
+        update_version_file "$target" "$key" "$NEW_VERSION"
+        git add -- "$target"
+    fi
+    commit_if_staged "chore: bump version to ${NEW_VERSION}"
 }
 
 # 目标 .rb 不存在时：Tap 里有同名文件就复制过来，没有则询问是否生成模板。
@@ -1759,11 +1889,23 @@ main() {
     ARCHIVE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/archive/refs/tags/${NEW_TAG}.tar.gz"
 
     if [[ "$RESUME_MODE" -eq 0 && "$HAS_RELEASE_TAG" -eq 1 ]]; then
-        if [[ "$CURRENT_VERSION" == "$NEW_VERSION" ]]; then
+        local tag_floor="$CURRENT_VERSION"   # 用来比较的已发布版本。版本来自文件时改为最新 tag
+        if [[ "${VERSION_FROM_FILE:-0}" -eq 1 ]]; then
+            tag_floor="$LATEST_TAG_VERSION"
+        fi
+        if [[ "$NEW_VERSION" == "$tag_floor" ]]; then
             die "$(t "New version matches the latest tag: ${NEW_VERSION}" "新版本与当前最新 tag 相同: ${NEW_VERSION}")"
         fi
+        if version_lt "$NEW_VERSION" "$tag_floor"; then
+            die "$(t "New version ${NEW_VERSION} cannot be lower than current version ${tag_floor}" "新版本 ${NEW_VERSION} 不能低于当前版本 ${tag_floor}")"
+        fi
+    fi
+    if [[ "$RESUME_MODE" -eq 0 && "${VERSION_FROM_FILE:-0}" -eq 1 ]]; then
+        if [[ "$NEW_VERSION" == "$CURRENT_VERSION" ]]; then
+            die "$(t "New version matches ${VERSION_KEY} in ${VERSION_FILE}: ${NEW_VERSION}" "新版本与 ${VERSION_FILE} 中的 ${VERSION_KEY} 相同: ${NEW_VERSION}")"
+        fi
         if version_lt "$NEW_VERSION" "$CURRENT_VERSION"; then
-            die "$(t "New version ${NEW_VERSION} cannot be lower than current version ${CURRENT_VERSION}" "新版本 ${NEW_VERSION} 不能低于当前版本 ${CURRENT_VERSION}")"
+            die "$(t "New version ${NEW_VERSION} cannot be lower than ${VERSION_KEY} ${CURRENT_VERSION} in ${VERSION_FILE}" "新版本 ${NEW_VERSION} 不能低于 ${VERSION_FILE} 中的 ${VERSION_KEY} ${CURRENT_VERSION}")"
         fi
     fi
 
@@ -1796,19 +1938,10 @@ main() {
         log "$(t "Updating ${FORMULA_FILE} url → ${ARCHIVE_URL}" "更新 ${FORMULA_FILE} 的 url → ${ARCHIVE_URL}")"
         if [[ "$DRY_RUN" -eq 0 ]]; then
             ensure_formula_version "$FORMULA_FILE" "$NEW_VERSION" "$ARCHIVE_URL"
-            if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
-                update_version_file brew-publish-formula TOOL_VERSION "$NEW_VERSION"
-                git add -- brew-publish-formula
-            fi
-            commit_if_staged "chore: bump version to ${NEW_VERSION}"
         else
             printf '%s\n' "$(t "[dry-run] update ${FORMULA_FILE} url → ${ARCHIVE_URL}" "[dry-run] 更新 ${FORMULA_FILE} 的 url → ${ARCHIVE_URL}")"
-            if [[ -f brew-publish-formula ]] && grep -q '^TOOL_VERSION="' brew-publish-formula; then
-                printf '%s\n' "$(t "[dry-run] update TOOL_VERSION in brew-publish-formula → ${NEW_VERSION}" "[dry-run] 更新 brew-publish-formula 的 TOOL_VERSION → ${NEW_VERSION}")"
-                run_cmd git add -- brew-publish-formula
-                run_cmd git commit -m "chore: bump version to ${NEW_VERSION}"
-            fi
         fi
+        stage_declared_version
 
         log "$(t "Creating tag ${NEW_TAG}" "创建 tag ${NEW_TAG}")"
         run_cmd git tag -a "$NEW_TAG" -m "Release ${NEW_TAG}"
